@@ -182,6 +182,7 @@ func (ppb *PostProcessingBuilder) Build(
 		},
 
 		FirecrackerConfig: fc.Config{
+			NativeMemory:       ppb.BuilderConfig.EROFSSnapshotDir != "",
 			KernelVersion:      ppb.Config.KernelVersion,
 			FirecrackerVersion: ppb.Config.FirecrackerVersion,
 		},
@@ -202,6 +203,9 @@ func (ppb *PostProcessingBuilder) Build(
 	}
 	if sourceLayer.Cached {
 		sandboxOptions = append(sandboxOptions, layer.ReservedBlocksOptions(ctx, ppb.featureFlags, ppb.Config.RootfsBlockSize())...)
+	}
+	if ppb.BuilderConfig.EROFSSnapshotDir != "" {
+		sandboxOptions = append(sandboxOptions, layer.WithMinimumFreeDisk(ppb.Config.FreeDiskSizeMB, ppb.Config.RootfsBlockSize()))
 	}
 
 	// Always restart the sandbox for the final layer to properly wire the rootfs path for the final template
@@ -230,6 +234,10 @@ func (ppb *PostProcessingBuilder) Build(
 		},
 	)
 	if err != nil {
+		var diskErr *layer.InsufficientFreeDiskError
+		if errors.As(err, &diskErr) {
+			return phases.LayerResult{}, phases.NewPhaseBuildError(ppb.Metadata(), diskErr)
+		}
 		return phases.LayerResult{}, fmt.Errorf("error running start and ready commands in sandbox: %w", err)
 	}
 

@@ -3,8 +3,11 @@
 package base
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases"
 )
 
 // Provisioning must not decide the chrony time source: it runs on a build node,
@@ -27,5 +30,41 @@ func TestProvisionScriptDefersChronySourceToBoot(t *testing.T) {
 		if !strings.Contains(provisionScriptFile, want) {
 			t.Errorf("provision.sh missing chrony config line %q", want)
 		}
+	}
+}
+
+func TestProvisionAptMirror(t *testing.T) {
+	t.Setenv("E2B_APT_MIRROR", "")
+	t.Setenv("E2B_APT_SECURITY_MIRROR", "")
+	params := ProvisionScriptParams{BusyBox: "/busybox", DistroSelector: "# distro selector"}
+	baseline, err := getProvisionScript(context.Background(), params)
+	if err != nil || strings.Contains(baseline, "E2B_APT_ARCHIVE=") {
+		t.Fatalf("default: %v", err)
+	}
+	t.Setenv("E2B_APT_MIRROR", "https://mirrors.aliyun.com/debian")
+	if _, err := getProvisionScript(context.Background(), params); err == nil {
+		t.Fatal("incomplete mirror must reject script generation")
+	}
+	t.Setenv("E2B_APT_SECURITY_MIRROR", "https://deb.debian.org/debian-security")
+	script, err := getProvisionScript(context.Background(), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := strings.Index(script, "# distro selector")
+	rewrite := strings.Index(script, "E2B_APT_ARCHIVE='https://mirrors.aliyun.com/debian'")
+	install := strings.Index(script, "e2b_pkg_install $MISSING")
+	if selector < 0 || rewrite < selector || install < rewrite {
+		t.Fatal("mirror must run after distro detection and before installation")
+	}
+}
+
+func TestAptMirrorRejectedBeforeBaseHashDependencies(t *testing.T) {
+	t.Setenv("E2B_APT_MIRROR", "https://mirrors.aliyun.com/debian")
+	t.Setenv("E2B_APT_SECURITY_MIRROR", "")
+	// No cache, feature-flag client, or VM factory: invalid configuration must
+	// fail before consulting any of these or allowing a cached layer to win.
+	bb := &BaseBuilder{}
+	if _, err := bb.Hash(context.Background(), phases.LayerResult{}); err == nil || !strings.Contains(err.Error(), "E2B_APT_SECURITY_MIRROR") {
+		t.Fatalf("expected early configuration failure, got %v", err)
 	}
 }

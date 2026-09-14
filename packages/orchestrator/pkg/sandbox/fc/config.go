@@ -26,6 +26,11 @@ const (
 type Config struct {
 	KernelVersion      string
 	FirecrackerVersion string
+
+	// NativeMemory selects ordinary-page RAM with native Firecracker dirty
+	// tracking and Full/Diff exports. Restores must use ResumeFile. The zero
+	// value preserves the UFFD backend and its existing memory export path.
+	NativeMemory bool
 }
 
 func (t Config) SandboxKernelDir() string {

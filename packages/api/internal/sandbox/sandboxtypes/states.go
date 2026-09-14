@@ -90,6 +90,9 @@ type RemoveOpts struct {
 	// was never in scope. Empty means "remove whatever is stored", which is
 	// correct for callers acting on a fresh read or on user intent.
 	ExpectExecutionID string
+	// Checkpoints preserve ExecutionID, so delayed reconciliation also pins
+	// the operation before removing its failed runtime.
+	ExpectCheckpointBuildID string
 }
 
 var AllowedTransitions = map[State]map[State]bool{

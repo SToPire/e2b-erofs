@@ -28,6 +28,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/layer"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases/base/aptmirror"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/writer"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
@@ -55,15 +56,21 @@ type ProvisionScriptParams struct {
 	Provider   string
 	// DistroSelector is the generated POSIX-sh block that selects the base
 	// image's distro profile by its /etc/os-release ID.
-	DistroSelector string
+	DistroSelector  string
+	AptMirrorScript string
 }
 
 func getProvisionScript(
 	ctx context.Context,
 	params ProvisionScriptParams,
 ) (string, error) {
+	mirror, err := aptmirror.FromEnv()
+	if err != nil {
+		return "", err
+	}
+	params.AptMirrorScript = mirror.Script()
 	var scriptDef bytes.Buffer
-	err := ProvisionScriptTemplate.Execute(&scriptDef, params)
+	err = ProvisionScriptTemplate.Execute(&scriptDef, params)
 	if err != nil {
 		return "", fmt.Errorf("error executing provision script: %w", err)
 	}

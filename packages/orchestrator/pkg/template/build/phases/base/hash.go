@@ -13,6 +13,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/buildcontext"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases/base/aptmirror"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases/base/distro"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/storage/cache"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
@@ -22,6 +23,11 @@ import (
 func (bb *BaseBuilder) Hash(ctx context.Context, _ phases.LayerResult) (string, error) {
 	ctx, span := tracer.Start(ctx, "hash base")
 	defer span.End()
+
+	mirror, err := aptmirror.FromEnv()
+	if err != nil {
+		return "", err
+	}
 
 	var baseSource string
 	if bb.Config.FromTemplate != nil {
@@ -51,6 +57,10 @@ func (bb *BaseBuilder) Hash(ctx context.Context, _ phases.LayerResult) (string, 
 		// at the fallback value, keep the provisioning-contract hash above
 	); val != featureflags.BuildProvisionVersion.Fallback() {
 		provisionVersion = strconv.FormatInt(int64(val), 10)
+	}
+
+	if rendersRootfsFiles(bb.BuildContext) && mirror.CacheKey() != "" {
+		provisionVersion = cache.HashKeys(provisionVersion, mirror.CacheKey())
 	}
 
 	attrs := []attribute.KeyValue{

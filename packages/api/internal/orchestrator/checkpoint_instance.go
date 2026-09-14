@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -70,18 +71,38 @@ func (o *Orchestrator) CheckpointSandbox(ctx context.Context, teamID uuid.UUID, 
 	// orchestrator with the same ExecutionID. Once the pause has started, the
 	// orchestrator stops the old sandbox itself on error; RemoveSandbox is
 	// still needed to clean up API-side state (store, routing, analytics).
+	intent, prepareErr := o.prepareNativeCheckpoint(ctx, sbx, upsertResult.BuildID, types.BuildStatusSuccess)
+	if prepareErr != nil {
+		o.failSnapshotBuild(context.WithoutCancel(ctx), upsertResult.BuildID, prepareErr)
+		return fmt.Errorf("prepare native checkpoint: %w", prepareErr)
+	}
 	client, childCtx := node.GetClient(ctx)
 	_, err = client.Sandbox.Checkpoint(childCtx, &orchestrator.SandboxCheckpointRequest{
 		SandboxId: sbx.SandboxID,
 		BuildId:   upsertResult.BuildID.String(),
 		Metadata:  map[string]string{storageopts.ObjectMetadataTemplateID: upsertResult.TemplateID},
 	})
+	if intent != nil {
+		if receiptErr := o.observeCheckpointResult(ctx, intent, err); receiptErr != nil {
+			err = errors.Join(err, receiptErr)
+		}
+		// Release this callback before the reconciler applies an execution-pinned
+		// transition. Unknown outcomes remain Snapshotting, never presumed live.
+		finish(errCheckpointPending)
+		if err := o.finishNativeCheckpoint(ctx, *intent, err); err != nil {
+			return err
+		}
+		telemetry.ReportEvent(ctx, "Checkpointed sandbox")
+		return nil
+	}
 	if err != nil {
 		// Cleanup must run even when the checkpoint failed because this
 		// request's context was cancelled (e.g. client disconnect mid-fork).
 		cleanupCtx := context.WithoutCancel(ctx)
 
-		o.failSnapshotBuild(cleanupCtx, upsertResult.BuildID, err)
+		if recordErr := o.recordCheckpointFailure(cleanupCtx, sandboxID, upsertResult.BuildID, types.BuildStatusSuccess, err); recordErr != nil {
+			err = errors.Join(err, recordErr)
+		}
 
 		// The orchestrator rejects these before pausing the VM (envd too old,
 		// starting-sandboxes queue full), so the sandbox is still running

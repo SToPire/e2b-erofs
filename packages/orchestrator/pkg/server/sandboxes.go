@@ -296,6 +296,10 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 		return nil, fmt.Errorf("failed to read template metadata: %w", err)
 	}
 
+	if _, native := sbxtemplate.EROFS(template); native && req.GetFilesystemBoot() {
+		return nil, status.Error(codes.FailedPrecondition, "EROFS snapshots require File memory restore")
+	}
+
 	fsOnly = meta.IsFilesystemOnly()
 	filesystemBooted = filesystemBoot(meta, req)
 
@@ -850,6 +854,10 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 		return nil, status.Error(codes.NotFound, "sandbox not found")
 	}
 
+	if sbx.UsesEROFS() && in.GetFilesystemOnly() {
+		return nil, status.Error(codes.FailedPrecondition, "EROFS snapshots require memory and device state")
+	}
+
 	ctx = featureflags.AddToContext(
 		ctx,
 		ldcontext.NewBuilder(in.GetSandboxId()).
@@ -963,7 +971,7 @@ func (s *Server) Pause(ctx context.Context, in *orchestrator.SandboxPauseRequest
 	// Skip it for a filesystem-only pause: that snapshot has no memory diff, so a
 	// memory resume of it would just fail (the resume is reserved for memory
 	// snapshots; fs-only is a reboot) — there is no memory working set to harvest.
-	if !in.GetFilesystemOnly() {
+	if !in.GetFilesystemOnly() && !res.localEROFS {
 		s.harvestResumePrefetchAsync(ctx, sbx, res, in.GetBuildId(), res.objectMetadata)
 	}
 
@@ -1013,6 +1021,12 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 
 		return nil, status.Errorf(codes.NotFound, "sandbox '%s' not found", in.GetSandboxId())
 	}
+
+	operation, operationErr := s.beginNativeCheckpoint(ctx, sbx, in)
+	if operationErr != nil {
+		return nil, operationErr
+	}
+	defer s.finishNativeCheckpoint(operation)
 
 	ctx = featureflags.AddToContext(
 		ctx,
@@ -1076,7 +1090,7 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 	// balloon free-page-reporting pause API). Everything else takes the
 	// resume-fresh flow, so an older FC degrades gracefully rather than
 	// erroring.
-	inPlace := sbx.UseSyncWP() &&
+	inPlace := !sbx.UsesEROFS() && sbx.UseSyncWP() &&
 		s.featureFlags.BoolFlag(ctx, featureflags.InPlaceCheckpointFlag) &&
 		firecrackerSupports(ctx, sbx, "in-place checkpoint", (*fcversion.Info).HasInPlaceCheckpoint)
 
@@ -1109,6 +1123,9 @@ func (s *Server) Checkpoint(ctx context.Context, in *orchestrator.SandboxCheckpo
 // it to Running, not kill it), resume-fresh passes Internal (its failure
 // closure tears the resumed sandbox down, so a kill describes reality).
 func (s *Server) runCheckpointUpload(ctx context.Context, sbx *sandbox.Sandbox, res *snapshotResult, in *orchestrator.SandboxCheckpointRequest, failureCode codes.Code, onUploadFailure func()) error {
+	if res.localEROFS {
+		return nil
+	}
 	async := s.featureFlags.BoolFlag(ctx, featureflags.PeerToPeerAsyncCheckpointFlag)
 	if async && res.memoryExportDeferred {
 		// A deferred (CoW window) memory export can still FAIL after this
@@ -1268,7 +1285,7 @@ func (s *Server) checkpointInPlace(ctx context.Context, sbx *sandbox.Sandbox, in
 // from the produced build (new FC process, same ExecutionID). This is the
 // pre-in-place checkpoint flow and the fallback whenever in-place is not
 // available (async-WP sandbox or in-place-checkpoint flag off).
-func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox, in *orchestrator.SandboxCheckpointRequest) (*orchestrator.SandboxCheckpointResponse, error) {
+func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox, in *orchestrator.SandboxCheckpointRequest) (response *orchestrator.SandboxCheckpointResponse, resultErr error) {
 	// The old sandbox is being replaced: remove it from the live registry up
 	// front (also the natural exclusion against concurrent lifecycle RPCs —
 	// a second Checkpoint or a Kill no longer finds it) and always stop it
@@ -1303,6 +1320,15 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		return nil, status.Errorf(codes.Internal, "error snapshotting sandbox '%s': %s", in.GetSandboxId(), err)
 	}
 
+	if res.localEROFS {
+		s.noteNativeCommit(in.GetBuildId())
+		defer func() {
+			if resultErr != nil {
+				resultErr = orchestrator.CheckpointCommittedError(in.GetBuildId(), resultErr)
+			}
+		}()
+	}
+
 	// Get the template for resume
 	template, err := s.templateCache.GetTemplate(ctx, in.GetBuildId(), true, false,
 		sbxtemplate.GetTemplateOpts{MaxSandboxLengthHours: sbx.Config.MaxSandboxLengthHours})
@@ -1319,7 +1345,7 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 	resumedSbx, err := s.sandboxFactory.ResumeSandbox(
 		ctx,
 		template,
-		sbx.Config,
+		sbx.Config.Clone(),
 		sandbox.RuntimeMetadata{
 			TemplateID:  sbx.Runtime.TemplateID,
 			SandboxID:   sbx.Runtime.SandboxID,
@@ -1330,7 +1356,7 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		},
 		sbx.GetStartedAt(),
 		sbx.GetEndAt(),
-		sbx.APIStoredConfig,
+		proto.CloneOf(sbx.APIStoredConfig),
 		// Defer routing until after the upgrade's post-/init (markSandboxLive below).
 		sandbox.WithDeferredLiveRegistration(),
 	)
@@ -1338,6 +1364,10 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 		telemetry.ReportCriticalError(ctx, "error resuming sandbox after checkpoint", err, telemetry.WithSandboxID(in.GetSandboxId()))
 
 		return nil, status.Errorf(codes.Internal, "error resuming sandbox after checkpoint: %s", err)
+	}
+
+	if res.localEROFS {
+		s.noteNativeReplacement(in.GetBuildId(), resumedSbx)
 	}
 
 	// Collect prefetch data immediately after resume while it's most accurate
@@ -1438,6 +1468,7 @@ func (s *Server) getSandboxExecutionData(sbx *sandbox.Sandbox) map[string]any {
 // snapshotResult holds the data produced by snapshotAndCacheSandbox that
 // callers need to start the background remote storage upload.
 type snapshotResult struct {
+	localEROFS         bool
 	meta               metadata.Template
 	schedulingMetadata *orchestrator.SchedulingMetadata
 	upload             *sandbox.Upload
@@ -1499,7 +1530,12 @@ func (s *Server) snapshotAndCacheSandbox(
 
 	snapshot, err := sbx.Pause(ctx, meta, sandbox.SnapshotUseCasePause, pauseOpts...)
 	if err != nil {
+		s.noteNativeCapture(buildID, err)
 		return nil, fmt.Errorf("error snapshotting sandbox: %w", err)
+	}
+
+	if snapshot.LocalEROFS != nil {
+		return &snapshotResult{localEROFS: true, meta: meta, schedulingMetadata: snapshot.SchedulingMetadata}, nil
 	}
 
 	err = s.templateCache.AddSnapshot(
@@ -1582,6 +1618,9 @@ func (s *Server) snapshotAndCacheSandbox(
 // background and cleans up the Redis peer key once done. Used by the Pause
 // handler where no prefetch data is available.
 func (s *Server) uploadSnapshotAsync(ctx context.Context, sbx *sandbox.Sandbox, res *snapshotResult) {
+	if res.localEROFS {
+		return
+	}
 	// Detach from the request: the upload retries for up to uploadTotalBudget.
 	// A graceful shutdown waits for it to finish (see Server.Close via uploadsWG)
 	// rather than cancelling, so an in-flight snapshot isn't dropped on restart.

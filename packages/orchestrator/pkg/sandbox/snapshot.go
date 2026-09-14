@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/erofs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/scheduling"
 	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/orchestrator"
@@ -28,6 +29,9 @@ func NewResolvedDiffHeader(h *header.Header) *DiffHeader {
 }
 
 type Snapshot struct {
+	// LocalEROFS is published atomically in the local store. It has no legacy
+	// header/diff artifacts and must never be sent to the legacy uploader.
+	LocalEROFS *erofs.Snapshot
 	// MemorySnapshot bundles the memfile diff, its header, and block size. It is
 	// empty (NoDiff) for filesystem-only snapshots (see FilesystemSnapshot).
 	MemorySnapshot MemorySnapshot
@@ -109,6 +113,9 @@ func NewFilesystemOnlySnapshot(
 }
 
 func (s *Snapshot) Close(ctx context.Context) error {
+	if s.LocalEROFS != nil {
+		return nil
+	}
 	err := s.cleanup.Run(ctx)
 	if err != nil {
 		return fmt.Errorf("error cleaning up snapshot: %w", err)

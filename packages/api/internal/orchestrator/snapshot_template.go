@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -89,12 +90,28 @@ func (o *Orchestrator) CreateSnapshotTemplate(ctx context.Context, teamID uuid.U
 	// orchestrator with the same ExecutionID. On error the orchestrator
 	// kills the sandbox itself; RemoveSandbox is still needed to clean up
 	// API-side state (store, routing, analytics).
+	intent, prepareErr := o.prepareNativeCheckpoint(ctx, sbx, upsertResult.BuildID, types.BuildStatusUploaded)
+	if prepareErr != nil {
+		o.failSnapshotBuild(context.WithoutCancel(ctx), upsertResult.BuildID, prepareErr)
+		return SnapshotTemplateResult{}, fmt.Errorf("prepare native checkpoint: %w", prepareErr)
+	}
 	client, childCtx := node.GetClient(ctx)
 	_, err = client.Sandbox.Checkpoint(childCtx, &orchestrator.SandboxCheckpointRequest{
 		SandboxId: sbx.SandboxID,
 		BuildId:   upsertResult.BuildID.String(),
 		Metadata:  map[string]string{storageopts.ObjectMetadataTemplateID: snapshotTemplateEnvID},
 	})
+	if intent != nil {
+		if receiptErr := o.observeCheckpointResult(ctx, intent, err); receiptErr != nil {
+			err = errors.Join(err, receiptErr)
+		}
+		finish(errCheckpointPending)
+		if err := o.finishNativeCheckpoint(ctx, *intent, err); err != nil {
+			return SnapshotTemplateResult{}, err
+		}
+		telemetry.ReportEvent(ctx, "Snapshot template completed")
+		return SnapshotTemplateResult{TemplateID: snapshotTemplateEnvID, BuildID: upsertResult.BuildID}, nil
+	}
 	if err != nil {
 		// Cleanup must run even when the checkpoint failed because this
 		// request's context was cancelled (e.g. client disconnect) — a
@@ -102,7 +119,9 @@ func (o *Orchestrator) CreateSnapshotTemplate(ctx context.Context, teamID uuid.U
 		// sandbox is restored to Running. Mirrors CheckpointSandbox.
 		cleanupCtx := context.WithoutCancel(ctx)
 
-		o.failSnapshotBuild(cleanupCtx, upsertResult.BuildID, err)
+		if recordErr := o.recordCheckpointFailure(cleanupCtx, sandboxID, upsertResult.BuildID, types.BuildStatusUploaded, err); recordErr != nil {
+			err = errors.Join(err, recordErr)
+		}
 
 		// The orchestrator returns these when the sandbox is still running
 		// healthy on its node (rejected before pausing the VM, or an

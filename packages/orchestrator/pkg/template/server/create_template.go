@@ -111,6 +111,9 @@ func (s *ServerStore) TemplateCreate(ctx context.Context, templateRequest *templ
 	hugePages := fcInfo.HasHugePages()
 	freePageReporting := fcInfo.HasFreePageReporting() && s.featureFlags.BoolFlag(ctx, featureflags.FreePageReportingFlag)
 	freePageHinting := fcInfo.HasFreePageHinting() && featureflags.IsFreePageHintingEnabled(ctx, s.featureFlags)
+	if s.builder.EROFSEnabled() {
+		hugePages, freePageReporting, freePageHinting = false, false, false
+	}
 
 	childSpan.SetAttributes(
 		telemetry.WithTemplateID(cfg.GetTemplateID()),

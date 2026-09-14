@@ -20,12 +20,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SandboxService_Create_FullMethodName     = "/SandboxService/Create"
-	SandboxService_Update_FullMethodName     = "/SandboxService/Update"
-	SandboxService_List_FullMethodName       = "/SandboxService/List"
-	SandboxService_Delete_FullMethodName     = "/SandboxService/Delete"
-	SandboxService_Pause_FullMethodName      = "/SandboxService/Pause"
-	SandboxService_Checkpoint_FullMethodName = "/SandboxService/Checkpoint"
+	SandboxService_Create_FullMethodName           = "/SandboxService/Create"
+	SandboxService_Update_FullMethodName           = "/SandboxService/Update"
+	SandboxService_List_FullMethodName             = "/SandboxService/List"
+	SandboxService_Delete_FullMethodName           = "/SandboxService/Delete"
+	SandboxService_Pause_FullMethodName            = "/SandboxService/Pause"
+	SandboxService_Checkpoint_FullMethodName       = "/SandboxService/Checkpoint"
+	SandboxService_CheckpointStatus_FullMethodName = "/SandboxService/CheckpointStatus"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
@@ -38,6 +39,8 @@ type SandboxServiceClient interface {
 	Delete(ctx context.Context, in *SandboxDeleteRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	Pause(ctx context.Context, in *SandboxPauseRequest, opts ...grpc.CallOption) (*SandboxPauseResponse, error)
 	Checkpoint(ctx context.Context, in *SandboxCheckpointRequest, opts ...grpc.CallOption) (*SandboxCheckpointResponse, error)
+	// Read existing native checkpoint facts without capturing or resuming a VM.
+	CheckpointStatus(ctx context.Context, in *SandboxCheckpointStatusRequest, opts ...grpc.CallOption) (*SandboxCheckpointStatusResponse, error)
 }
 
 type sandboxServiceClient struct {
@@ -108,6 +111,16 @@ func (c *sandboxServiceClient) Checkpoint(ctx context.Context, in *SandboxCheckp
 	return out, nil
 }
 
+func (c *sandboxServiceClient) CheckpointStatus(ctx context.Context, in *SandboxCheckpointStatusRequest, opts ...grpc.CallOption) (*SandboxCheckpointStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxCheckpointStatusResponse)
+	err := c.cc.Invoke(ctx, SandboxService_CheckpointStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SandboxServiceServer is the server API for SandboxService service.
 // All implementations must embed UnimplementedSandboxServiceServer
 // for forward compatibility.
@@ -118,6 +131,8 @@ type SandboxServiceServer interface {
 	Delete(context.Context, *SandboxDeleteRequest) (*emptypb.Empty, error)
 	Pause(context.Context, *SandboxPauseRequest) (*SandboxPauseResponse, error)
 	Checkpoint(context.Context, *SandboxCheckpointRequest) (*SandboxCheckpointResponse, error)
+	// Read existing native checkpoint facts without capturing or resuming a VM.
+	CheckpointStatus(context.Context, *SandboxCheckpointStatusRequest) (*SandboxCheckpointStatusResponse, error)
 	mustEmbedUnimplementedSandboxServiceServer()
 }
 
@@ -145,6 +160,9 @@ func (UnimplementedSandboxServiceServer) Pause(context.Context, *SandboxPauseReq
 }
 func (UnimplementedSandboxServiceServer) Checkpoint(context.Context, *SandboxCheckpointRequest) (*SandboxCheckpointResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Checkpoint not implemented")
+}
+func (UnimplementedSandboxServiceServer) CheckpointStatus(context.Context, *SandboxCheckpointStatusRequest) (*SandboxCheckpointStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckpointStatus not implemented")
 }
 func (UnimplementedSandboxServiceServer) mustEmbedUnimplementedSandboxServiceServer() {}
 func (UnimplementedSandboxServiceServer) testEmbeddedByValue()                        {}
@@ -275,6 +293,24 @@ func _SandboxService_Checkpoint_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_CheckpointStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SandboxCheckpointStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).CheckpointStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_CheckpointStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).CheckpointStatus(ctx, req.(*SandboxCheckpointStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SandboxService_ServiceDesc is the grpc.ServiceDesc for SandboxService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -305,6 +341,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Checkpoint",
 			Handler:    _SandboxService_Checkpoint_Handler,
+		},
+		{
+			MethodName: "CheckpointStatus",
+			Handler:    _SandboxService_CheckpointStatus_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

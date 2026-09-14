@@ -32,6 +32,8 @@ fi
 
 {{ .DistroSelector }}
 
+{{ .AptMirrorScript }}
+
 echo "Provisioning for distro '$E2B_DISTRO_ID' (init=$E2B_INIT_BIN, timesync=$E2B_TIMESYNC_UNIT, admin-group=$E2B_ADMIN_GROUP)"
 
 # Persist the resolved identity for later build phases (finalize sources it),

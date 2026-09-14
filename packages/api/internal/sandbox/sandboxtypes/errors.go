@@ -59,3 +59,5 @@ func (PauseQueueExhaustedError) Error() string {
 // removed and the ID reused by a resume or recreate. Raised only when the
 // caller opted in via RemoveOpts.ExpectExecutionID.
 var ErrExecutionMismatch = errors.New("sandbox execution no longer matches")
+
+var ErrCheckpointMismatch = errors.New("sandbox checkpoint no longer matches")

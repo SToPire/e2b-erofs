@@ -101,6 +101,9 @@ type Server struct {
 
 	done      chan struct{}
 	closeOnce sync.Once
+	// Native checkpoint receipts survive the RPC and separate publication from
+	// runtime recovery; the identity record also lives in the local store.
+	nativeCheckpoints sync.Map
 }
 
 type ServiceConfig struct {

@@ -212,6 +212,7 @@ func (bb *BaseBuilder) buildLayerFromOCI(
 		},
 
 		FirecrackerConfig: fc.Config{
+			NativeMemory:       bb.BuilderConfig.EROFSSnapshotDir != "",
 			KernelVersion:      bb.Config.KernelVersion,
 			FirecrackerVersion: bb.Config.FirecrackerVersion,
 		},

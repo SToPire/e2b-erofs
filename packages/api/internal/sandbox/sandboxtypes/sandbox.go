@@ -132,6 +132,10 @@ type Sandbox struct {
 	Iam *types.SandboxIam `json:"iam,omitempty"`
 
 	State State `json:"state"`
+	// Binds asynchronous reconciliation to one checkpoint within an execution.
+	CheckpointBuildID string `json:"checkpointBuildID,omitempty"`
+	// Request-local proof of the transition acquired by StartRemoving.
+	TransitionID string `json:"-"`
 }
 
 func (s Sandbox) ToAPISandbox() *api.Sandbox {

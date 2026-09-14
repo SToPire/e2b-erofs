@@ -228,6 +228,41 @@ message SandboxCheckpointResponse {
   SchedulingMetadata scheduling_metadata = 1;
 }
 
+message SandboxCheckpointStatusRequest {
+  string sandbox_id = 1;
+  string build_id = 2;
+  string execution_id = 3;
+  string team_id = 4;
+}
+
+enum CheckpointSnapshotState {
+  CHECKPOINT_SNAPSHOT_UNKNOWN = 0;
+  CHECKPOINT_SNAPSHOT_IN_PROGRESS = 1;
+  CHECKPOINT_SNAPSHOT_COMMITTED = 2;
+  CHECKPOINT_SNAPSHOT_NOT_COMMITTED = 3;
+  CHECKPOINT_SNAPSHOT_DURABILITY_UNKNOWN = 4;
+  // A successful RAM capture is retained for explicit local recovery. It is
+  // not yet a committed snapshot, and must not be marked failed by timeout.
+  CHECKPOINT_SNAPSHOT_CAPTURED = 5;
+}
+
+enum CheckpointRuntimeState {
+  CHECKPOINT_RUNTIME_UNKNOWN = 0;
+  CHECKPOINT_RUNTIME_TRANSITIONING = 1;
+  CHECKPOINT_RUNTIME_RUNNING = 2;
+  CHECKPOINT_RUNTIME_STOPPED = 3;
+}
+
+message SandboxCheckpointStatusResponse {
+  bool native = 1;
+  CheckpointSnapshotState snapshot_state = 2;
+  CheckpointRuntimeState runtime_state = 3;
+  string build_id = 4;
+  string execution_id = 5;
+  string lifecycle_id = 6;
+  string runtime_build_id = 7;
+}
+
 message RunningSandbox {
   // Deprecated: the API no longer rebuilds sandbox state from this list. Redis
   // is the source of truth; List is only used to detect sandboxes running on a
@@ -262,4 +297,6 @@ service SandboxService {
   rpc Delete(SandboxDeleteRequest) returns (google.protobuf.Empty);
   rpc Pause(SandboxPauseRequest) returns (SandboxPauseResponse);
   rpc Checkpoint(SandboxCheckpointRequest) returns (SandboxCheckpointResponse);
+  // Read existing native checkpoint facts without capturing or resuming a VM.
+  rpc CheckpointStatus(SandboxCheckpointStatusRequest) returns (SandboxCheckpointStatusResponse);
 }

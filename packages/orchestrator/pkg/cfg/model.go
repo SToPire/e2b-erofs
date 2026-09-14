@@ -21,16 +21,21 @@ import (
 const DefaultBusyboxVersion = "1.36.1"
 
 type BuilderConfig struct {
-	DomainName             string `env:"DOMAIN_NAME"              envDefault:""`
-	FirecrackerVersionsDir string `env:"FIRECRACKER_VERSIONS_DIR" envDefault:"/fc-versions"`
-	BusyboxVersion         string `env:"BUSYBOX_VERSION"          envDefault:"1.36.1"`
-	HostBusyboxDir         string `env:"HOST_BUSYBOX_DIR"         envDefault:"/fc-busybox"`
-	HostEnvdPath           string `env:"HOST_ENVD_PATH"           envDefault:"/fc-envd/envd"`
-	HostKernelsDir         string `env:"HOST_KERNELS_DIR"         envDefault:"/fc-kernels"`
-	OrchestratorBaseDir    string `env:"ORCHESTRATOR_BASE_PATH"   envDefault:"/orchestrator"`
-	SandboxDir             string `env:"SANDBOX_DIR"              envDefault:"/fc-vm"`
-	SharedChunkCacheDir    string `env:"SHARED_CHUNK_CACHE_PATH"`
-	TemplatesDir           string `env:"TEMPLATES_DIR,expand"     envDefault:"${ORCHESTRATOR_BASE_PATH}/build-templates"`
+	// EROFSSnapshotDir enables local EROFS builds and restores. It must be on
+	// persistent local storage, outside the disposable template/build caches.
+	EROFSSnapshotDir          string `env:"EROFS_SNAPSHOT_DIR"`
+	EROFSNativeMemoryVerified bool   `env:"EROFS_NATIVE_MEMORY_VERIFIED" envDefault:"false"`
+	EROFSMkfsPath             string `env:"EROFS_MKFS_PATH" envDefault:"mkfs.erofs"`
+	DomainName                string `env:"DOMAIN_NAME"              envDefault:""`
+	FirecrackerVersionsDir    string `env:"FIRECRACKER_VERSIONS_DIR" envDefault:"/fc-versions"`
+	BusyboxVersion            string `env:"BUSYBOX_VERSION"          envDefault:"1.36.1"`
+	HostBusyboxDir            string `env:"HOST_BUSYBOX_DIR"         envDefault:"/fc-busybox"`
+	HostEnvdPath              string `env:"HOST_ENVD_PATH"           envDefault:"/fc-envd/envd"`
+	HostKernelsDir            string `env:"HOST_KERNELS_DIR"         envDefault:"/fc-kernels"`
+	OrchestratorBaseDir       string `env:"ORCHESTRATOR_BASE_PATH"   envDefault:"/orchestrator"`
+	SandboxDir                string `env:"SANDBOX_DIR"              envDefault:"/fc-vm"`
+	SharedChunkCacheDir       string `env:"SHARED_CHUNK_CACHE_PATH"`
+	TemplatesDir              string `env:"TEMPLATES_DIR,expand"     envDefault:"${ORCHESTRATOR_BASE_PATH}/build-templates"`
 
 	DefaultCacheDir string `env:"DEFAULT_CACHE_DIR,expand" envDefault:"${ORCHESTRATOR_BASE_PATH}/build"`
 
@@ -42,6 +47,7 @@ type BuilderConfig struct {
 
 func makePathsAbsolute(c *BuilderConfig) error {
 	for _, item := range []*string{
+		&c.EROFSSnapshotDir,
 		&c.DefaultCacheDir,
 		&c.FirecrackerVersionsDir,
 		&c.HostBusyboxDir,
@@ -72,7 +78,66 @@ func makePathsAbsolute(c *BuilderConfig) error {
 		*item = dir
 	}
 
+	if c.EROFSSnapshotDir != "" {
+		if !c.EROFSNativeMemoryVerified {
+			return fmt.Errorf("EROFS_SNAPSHOT_DIR requires EROFS_NATIVE_MEMORY_VERIFIED after testing the deployed Firecracker binary")
+		}
+		canonical, err := canonicalConfigPath(c.EROFSSnapshotDir)
+		if err != nil {
+			return err
+		}
+		c.EROFSSnapshotDir = canonical
+		for _, disposable := range []string{c.DefaultCacheDir, c.StorageConfig.SandboxCacheDir, c.StorageConfig.TemplateCacheDir, c.TemplatesDir, c.SandboxDir} {
+			if disposable == "" {
+				continue
+			}
+			disposable, err := canonicalConfigPath(disposable)
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(disposable, c.EROFSSnapshotDir)
+			if err != nil {
+				return err
+			}
+			if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))) {
+				return fmt.Errorf("EROFS_SNAPSHOT_DIR must be outside disposable or namespace-covered directory %q", disposable)
+			}
+		}
+	}
+
 	return nil
+}
+
+// Resolve existing ancestors too, since a store may not have been created yet.
+// This prevents a symlink alias from hiding a store underneath a cache cleanup
+// or the tmpfs mounted over SandboxDir in Firecracker's private namespace.
+func canonicalConfigPath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return resolved, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	info, statErr := os.Lstat(path)
+	if statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		// Reconstructing this name under its resolved parent would preserve an
+		// unresolved alias and bypass the containment check. Missing ordinary
+		// directories are allowed, but configured symlinks must resolve now.
+		return "", fmt.Errorf("configuration path %q contains a dangling symlink: %w", path, err)
+	}
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return "", statErr
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return "", err
+	}
+	resolved, err = canonicalConfigPath(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolved, filepath.Base(path)), nil
 }
 
 type Config struct {

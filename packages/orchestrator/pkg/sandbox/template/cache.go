@@ -20,6 +20,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/cfg"
 	blockmetrics "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block/metrics"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/erofs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template/peerclient"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/featureflags"
@@ -169,6 +170,28 @@ func (c *Cache) GetTemplate(
 		attribute.Bool("is_building", isBuilding),
 	))
 	defer span.End()
+
+	if c.config.EROFSSnapshotDir != "" {
+		store, err := erofs.NewStore(c.config.EROFSSnapshotDir, erofs.Options{MkfsPath: c.config.EROFSMkfsPath})
+		if err != nil {
+			return nil, err
+		}
+		// A committed local generation is authoritative. Corruption must surface
+		// instead of silently resolving an unrelated legacy object-store build.
+		if _, err := os.Stat(filepath.Join(store.Root, buildID)); err == nil {
+			snapshot, err := store.Load(buildID)
+			if err != nil {
+				return nil, fmt.Errorf("load EROFS template: %w", err)
+			}
+			paths, err := (storage.Paths{BuildID: buildID}).Cache(c.config.StorageConfig)
+			if err != nil {
+				return nil, err
+			}
+			return NewEROFSTemplate(paths, snapshot), nil
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
 
 	persistence := c.persistence
 	// Because of the template caching, if we enable the NFS cache feature flag,

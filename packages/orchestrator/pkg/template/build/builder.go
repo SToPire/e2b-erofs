@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -110,6 +111,41 @@ type Result struct {
 	SchedulingMetadata *orchestratorgrpc.SchedulingMetadata
 }
 
+func (b *Builder) EROFSEnabled() bool { return b.config.EROFSSnapshotDir != "" }
+
+func erofsBuildConfig(c config.TemplateConfig) config.TemplateConfig {
+	c.HugePages = false
+	c.FreePageReporting = false
+	c.FreePageHinting = false
+	// Once captured, the disk capacity is fixed. Reserve the requested final
+	// free space before the first snapshot and check it again before finalize.
+	c.DiskSizeMB = max(c.DiskSizeMB, c.FreeDiskSizeMB)
+	return c
+}
+
+// erofsInitialDiskConfig adjusts only the build-local initial filesystem target.
+// DiskSizeMB and FreeDiskSizeMB supplied by the caller describe usable space,
+// whereas provisioning sizes the filesystem before reserved blocks are applied.
+// Account for that reservation before the first immutable generation is made.
+// Existing templates retain their fixed capacity and are checked at finalize.
+func erofsInitialDiskConfig(c config.TemplateConfig, reservedMB int64) (config.TemplateConfig, error) {
+	const maxMiB = math.MaxInt64 / (1024 * 1024)
+	if c.DiskSizeMB < 0 || c.FreeDiskSizeMB < 0 || c.DiskSizeMB > maxMiB || c.FreeDiskSizeMB > maxMiB {
+		return c, errors.New("invalid EROFS disk size in MiB")
+	}
+	if c.FromTemplate != nil {
+		return c, nil
+	}
+	// ReservedBlocksOptions treats zero and negative flag values as disabled.
+	reservedMB = max(reservedMB, 0)
+	workingMB := max(c.DiskSizeMB, c.FreeDiskSizeMB)
+	if reservedMB > maxMiB || workingMB > maxMiB-reservedMB {
+		return c, errors.New("EROFS initial disk size plus reserved blocks overflows byte size")
+	}
+	c.DiskSizeMB = workingMB + reservedMB
+	return c, nil
+}
+
 // Build builds the template, uploads it to storage and returns the result metadata.
 // It works the following:
 // 1. Get docker image from the remote repository
@@ -125,6 +161,12 @@ type Result struct {
 // 8. Snapshot
 // 9. Upload template (and all not yet uploaded layers)
 func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.TemplateConfig, logsCore zapcore.Core) (r *Result, e error) {
+	if b.EROFSEnabled() {
+		if !b.config.EROFSNativeMemoryVerified {
+			return nil, errors.New("EROFS template builds require verified native Firecracker memory snapshots")
+		}
+		cfg = erofsBuildConfig(cfg)
+	}
 	// The caller's span (template-background-build for gRPC builds); captured
 	// before we open our own so the result attribute lands on both.
 	parentSpan := trace.SpanFromContext(ctx)
@@ -137,6 +179,13 @@ func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.Tem
 		featureflags.TemplateContext(cfg.TemplateID),
 		featureflags.TeamContext(cfg.TeamID),
 	)
+	if b.EROFSEnabled() {
+		var err error
+		cfg, err = erofsInitialDiskConfig(cfg, int64(b.featureFlags.IntFlag(ctx, featureflags.BuildReservedDiskSpaceMB)))
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Record build duration and result at the end. This defer is registered
 	// first so it runs last, after the deferred WrapContextAsUserError below has
@@ -219,7 +268,7 @@ func (b *Builder) Build(ctx context.Context, paths storage.Paths, cfg config.Tem
 	l.Info(ctx, fmt.Sprintf("Building template %s/%s", cfg.TemplateID, paths.BuildID))
 
 	defer func(ctx context.Context) {
-		if e == nil {
+		if e == nil || b.EROFSEnabled() {
 			return
 		}
 
@@ -339,7 +388,14 @@ func runBuild(
 		span.SetAttributes(attribute.Bool("use_cache", false))
 	}
 
-	index := cache.NewHashIndex(bc.CacheScope, builder.buildStorage, templateStorage)
+	var index cache.Index = cache.NewHashIndex(bc.CacheScope, builder.buildStorage, templateStorage)
+	if bc.BuilderConfig.EROFSSnapshotDir != "" {
+		localIndex, err := cache.NewEROFSIndex(bc.BuilderConfig.EROFSSnapshotDir, bc.CacheScope)
+		if err != nil {
+			return nil, fmt.Errorf("create local EROFS build index: %w", err)
+		}
+		index = localIndex
+	}
 
 	layerExecutor := layer.NewLayerExecutor(
 		bc,
@@ -437,7 +493,7 @@ func runBuild(
 	}
 	builders = append(builders, stepBuilders...)
 	// Grow the quiescent rootfs before finalize cold-boots it.
-	if builder.featureFlags.BoolFlag(ctx, featureflags.BuildEnsureFreeDiskSpace) {
+	if bc.BuilderConfig.EROFSSnapshotDir == "" && builder.featureFlags.BoolFlag(ctx, featureflags.BuildEnsureFreeDiskSpace) {
 		builders = append(builders, ensurefreedisk.New(
 			bc,
 			builder.sandboxFactory,
@@ -447,7 +503,9 @@ func runBuild(
 		))
 	}
 	builders = append(builders, postProcessingBuilder)
-	builders = append(builders, optimizeBuilder)
+	if bc.BuilderConfig.EROFSSnapshotDir == "" {
+		builders = append(builders, optimizeBuilder)
+	}
 
 	lastLayerResult, err := phases.Run(ctx, builder.logger, userLogger, bc, builder.metrics, builders)
 	if err != nil {
@@ -463,7 +521,20 @@ func runBuild(
 	// Get the base rootfs size from the template files
 	// This is the size of the rootfs after provisioning and before building the layers
 	// (as they don't change the rootfs size)
-	rootfsSize, err := getRootfsSize(ctx, builder.templateStorage, storage.Paths{BuildID: lastLayerResult.Metadata.Template.BuildID})
+	var rootfsSize uint64
+	if bc.BuilderConfig.EROFSSnapshotDir != "" {
+		t, loadErr := builder.templateCache.GetTemplate(ctx, lastLayerResult.Metadata.Template.BuildID, false, true)
+		if loadErr != nil {
+			return nil, fmt.Errorf("load completed EROFS template: %w", loadErr)
+		}
+		snapshot, ok := sbxtemplate.EROFS(t)
+		if !ok {
+			return nil, errors.New("EROFS build produced a legacy template")
+		}
+		rootfsSize = uint64(snapshot.Manifest.Disk.Size)
+	} else {
+		rootfsSize, err = getRootfsSize(ctx, builder.templateStorage, storage.Paths{BuildID: lastLayerResult.Metadata.Template.BuildID})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("error getting rootfs size: %w", err)
 	}

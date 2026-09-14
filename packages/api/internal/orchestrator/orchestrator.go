@@ -42,6 +42,9 @@ type SnapshotCacheInvalidator interface {
 }
 
 type Orchestrator struct {
+	checkpointRedis               redis.UniversalClient
+	checkpointCancel              context.CancelFunc
+	checkpointDone                chan struct{}
 	httpClient                    *http.Client
 	nodeDiscovery                 servicediscovery.Discoverer
 	sandboxStore                  *sandbox.Store
@@ -177,6 +180,7 @@ func New(
 		createdCounter: createdCounter,
 
 		snapshotUpsertSem: snapshotUpsertSem,
+		checkpointRedis:   redisClient,
 
 		// Without the node discovery loop, the local clusters registry is the
 		// only source of orchestrator nodes.
@@ -219,6 +223,7 @@ func New(
 
 	go o.startStatusLogging(ctx)
 	go o.updateBestOfKConfig(ctx)
+	o.startCheckpointReconciler(ctx)
 
 	return &o, nil
 }
@@ -275,6 +280,9 @@ func (o *Orchestrator) startStatusLogging(ctx context.Context) {
 
 func (o *Orchestrator) Close(ctx context.Context) error {
 	var errs []error
+	if err := o.stopCheckpointReconciler(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("stop checkpoint reconciler: %w", err))
+	}
 
 	connectedNodes := o.nodes.Items()
 	for _, node := range connectedNodes {

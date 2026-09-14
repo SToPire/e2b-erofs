@@ -29,6 +29,7 @@ import (
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/build"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/cgroup"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/envdbin"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/erofs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/network"
@@ -352,6 +353,14 @@ func (m *Metadata) SetEndAt(t time.Time) {
 }
 
 type Sandbox struct {
+	// Native capture serializes teardown with sealing; after FC exit the
+	// ordinary exit waiter must not close qcow2 before the capture owns it.
+	nativeCaptureMu sync.Mutex
+	nativeCapture   *nativeCapture
+	nativeBaseline  bool
+	nativeDiskSize  int64
+	nativeResources *nativeResources
+
 	*Resources
 	*Metadata
 
@@ -860,7 +869,7 @@ func (f *Factory) CreateSandbox(
 	ctx context.Context,
 	config *Config,
 	runtime RuntimeMetadata,
-	template template.Template,
+	t template.Template,
 	sandboxTimeout time.Duration,
 	rootfsCachePath string,
 	processOptions fc.ProcessOptions,
@@ -881,9 +890,17 @@ func (f *Factory) CreateSandbox(
 
 	exit := utils.NewErrorOnce()
 
+	var native *nativeResources
+	var discardStartup func() error
 	cleanup := NewCleanup()
 	defer func() {
 		if e != nil {
+			if native != nil {
+				e = errors.Join(e, native.closeUntilDone(context.WithoutCancel(ctx)))
+				if discardStartup != nil {
+					e = errors.Join(e, discardStartup())
+				}
+			}
 			cleanupErr := cleanup.Run(ctx)
 			e = errors.Join(e, cleanupErr)
 			handleSpanError(execSpan, &e)
@@ -895,51 +912,86 @@ func (f *Factory) CreateSandbox(
 
 	ipsPromise := getNetworkSlot(ctx, f.networkPool, cleanup, config.Network, f.Sandboxes.NetworkReleased, runtime.SandboxType.EgressClass())
 
-	sandboxFiles := template.Files().NewSandboxFiles(runtime.SandboxID)
+	sandboxFiles := t.Files().NewSandboxFiles(runtime.SandboxID)
 	cleanup.Add(ctx, cleanupFiles(f.config, sandboxFiles))
 
-	rootFS, err := template.Rootfs()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get rootfs: %w", err)
+	if config.FirecrackerConfig.NativeMemory && (f.config.EROFSSnapshotDir == "" || !f.config.EROFSNativeMemoryVerified) {
+		return nil, errors.New("EROFS build requires a local store and verified native Firecracker memory support")
+	}
+	if config.FirecrackerConfig.NativeMemory {
+		config.HugePages = false
+		native = &nativeResources{}
 	}
 
 	var rootfsProvider rootfs.Provider
-	if rootfsCachePath == "" {
-		rootfsProvider, err = rootfs.NewNBDProvider(
-			ctx,
-			rootFS,
-			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
-			f.devicePool,
-			f.featureFlags,
-		)
+	var nativeDiskSize int64
+	var err error
+	if source, ok := template.EROFS(t); ok {
+		if !config.FirecrackerConfig.NativeMemory {
+			return nil, errors.New("EROFS cold boot requires native memory configuration")
+		}
+		mounted, mountErr := source.Mount(ctx, f.config.EROFSSnapshotDir)
+		if mounted != nil {
+			native.closeMount = mounted.Close
+		}
+		if mountErr != nil {
+			return nil, mountErr
+		}
+		nativeDiskSize = source.Manifest.Disk.Size
+		provider, providerErr := newEROFSRootfs(ctx, f.devicePool, mounted.DiskPath, nativeDiskSize, f.config.EROFSSnapshotDir, source.Manifest.ID)
+		if provider != nil {
+			native.closeDisk = provider.Close
+			discardStartup = provider.discard
+		}
+		rootfsProvider, err = provider, providerErr
 	} else {
-		rootfsProvider, err = rootfs.NewDirectProvider(
-			ctx,
-			rootFS,
-			// Populate direct cache directly from the source file
-			// This is needed for marking all blocks as dirty and being able to read them directly
-			rootfsCachePath,
-		)
+		rootFS, rootErr := t.Rootfs()
+		if rootErr != nil {
+			return nil, fmt.Errorf("failed to get rootfs: %w", rootErr)
+		}
+		nativeDiskSize, err = rootFS.Size(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if native != nil {
+			rootfsProvider, err = newNativeRawRootfs(ctx, rootFS, rootfsCachePath, f.config.EROFSSnapshotDir)
+		} else if rootfsCachePath == "" {
+			rootfsProvider, err = rootfs.NewNBDProvider(ctx, rootFS, sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig), f.devicePool, f.featureFlags)
+		} else {
+			rootfsProvider, err = rootfs.NewDirectProvider(ctx, rootFS, rootfsCachePath)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
 	}
-	cleanup.Add(ctx, rootfsProvider.Close)
-	go func() {
-		runErr := rootfsProvider.Start(execCtx)
-		if runErr != nil {
-			runtime.Logger().Error(ctx, "rootfs overlay error", zap.Error(runErr))
+	if native != nil {
+		native.closeDisk = rootfsProvider.Close
+	} else {
+		cleanup.Add(ctx, rootfsProvider.Close)
+	}
+	if native != nil {
+		if err := rootfsProvider.Start(ctx); err != nil {
+			return nil, err
 		}
-	}()
-
-	memfile, err := template.Memfile(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get memfile: %w", err)
+	} else {
+		go func() {
+			runErr := rootfsProvider.Start(execCtx)
+			if runErr != nil {
+				runtime.Logger().Error(ctx, "rootfs overlay error", zap.Error(runErr))
+			}
+		}()
 	}
 
-	memfileSize, err := memfile.Size(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get memfile size: %w", err)
+	memfileSize := config.RamMB * 1024 * 1024
+	if !config.FirecrackerConfig.NativeMemory {
+		memfile, err := t.Memfile(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get memfile: %w", err)
+		}
+		memfileSize, err = memfile.Size(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get memfile size: %w", err)
+		}
 	}
 
 	// / ==== END of resources initialization ====
@@ -982,6 +1034,9 @@ func (f *Factory) CreateSandbox(
 		return nil, fmt.Errorf("failed to init FC: %w", err)
 	}
 
+	if native != nil {
+		native.process = fcHandle
+	}
 	throttleConfig := featureflags.GetTCPFirewallEgressThrottleConfig(ctx, f.featureFlags)
 	driveThrottleConfig := featureflags.GetBlockDriveThrottleConfig(ctx, f.featureFlags)
 
@@ -991,11 +1046,11 @@ func (f *Factory) CreateSandbox(
 	if config.HugePages {
 		fcPageSize = int64(header.HugepageSize)
 	}
-	resources := &Resources{
-		Slot:   ips,
-		rootfs: rootfsProvider,
-		memory: uffd.NewNoopMemory(memfileSize, fcPageSize),
+	var memoryBackend uffd.MemoryBackend = uffd.NewNoopMemory(memfileSize, fcPageSize)
+	if config.FirecrackerConfig.NativeMemory {
+		memoryBackend = uffd.NewFileMemory()
 	}
+	resources := &Resources{Slot: ips, rootfs: rootfsProvider, memory: memoryBackend}
 
 	metadata := &Metadata{
 		internalConfig: internalConfig{
@@ -1010,6 +1065,9 @@ func (f *Factory) CreateSandbox(
 	}
 
 	sbx := &Sandbox{
+		nativeBaseline:     config.FirecrackerConfig.NativeMemory,
+		nativeResources:    native,
+		nativeDiskSize:     nativeDiskSize,
 		LifecycleID:        lifecycleID,
 		LifecycleStartedAt: time.Now().UTC(),
 
@@ -1017,7 +1075,7 @@ func (f *Factory) CreateSandbox(
 		Metadata:     metadata,
 		cgroupHandle: cgroupHandle,
 
-		Template:  template,
+		Template:  t,
 		config:    f.config,
 		files:     sandboxFiles,
 		process:   fcHandle,
@@ -1097,11 +1155,14 @@ func (f *Factory) CreateSandbox(
 		ctx, span := tracer.Start(execCtx, "sandbox-exit-wait")
 		defer span.End()
 
-		// If the process exists, stop the sandbox properly
-		fcErr := fcHandle.Exit.Wait()
+		diskDone, diskErr := rootfsExit(rootfsProvider)
+		select {
+		case <-fcHandle.Exit.Done():
+		case <-diskDone:
+		}
 		err := sbx.Stop(ctx)
-
-		exit.SetError(errors.Join(err, fcErr))
+		fcErr := fcHandle.Exit.Wait()
+		exit.SetError(errors.Join(err, fcErr, diskErr()))
 	}()
 
 	if !createOpts.deferMarkRunning {
@@ -1227,15 +1288,37 @@ func (f *Factory) ResumeSandbox(
 
 	exit := utils.NewErrorOnce()
 
+	var native *nativeResources
+	var discardStartup func() error
 	cleanup := NewCleanup()
 	defer func() {
 		if e != nil {
+			if native != nil {
+				e = errors.Join(e, native.closeUntilDone(context.WithoutCancel(ctx)))
+				if discardStartup != nil {
+					e = errors.Join(e, discardStartup())
+				}
+			}
 			cleanupErr := cleanup.Run(ctx)
 			e = errors.Join(e, cleanupErr)
 			handleSpanError(execSpan, &e)
 			execSpan.End()
 		}
 	}()
+
+	erofsSnapshot, nativeMemory := template.EROFS(t)
+	if nativeMemory {
+		if f.config.EROFSSnapshotDir == "" || !f.config.EROFSNativeMemoryVerified {
+			return nil, errors.New("EROFS restore requires a configured local store and verified native Firecracker memory support")
+		}
+		// The artifact's format owns the RAM backend, regardless of request flags.
+		config.HugePages = false
+		config.FirecrackerConfig.NativeMemory = true
+		native = &nativeResources{}
+		if config.RamMB*1024*1024 != erofsSnapshot.Manifest.Memory.Size {
+			return nil, errors.New("EROFS restore cannot change RAM size")
+		}
+	}
 
 	lifecycleID := uuid.NewString()
 
@@ -1244,6 +1327,31 @@ func (f *Factory) ResumeSandbox(
 
 	telemetry.ReportEvent(ctx, "created sandbox files")
 
+	var mounted *erofs.Mounted
+	if nativeMemory {
+		var mountErr error
+		mounted, mountErr = erofsSnapshot.Mount(ctx, f.config.EROFSSnapshotDir)
+		if mounted != nil {
+			native.closeMount = mounted.Close
+		}
+		if mountErr != nil {
+			return nil, fmt.Errorf("mount EROFS snapshot: %w", mountErr)
+		}
+	}
+
+	var nativeOverlay *erofsRootfs
+	if nativeMemory {
+		var overlayErr error
+		nativeOverlay, overlayErr = newEROFSRootfs(ctx, f.devicePool, mounted.DiskPath, erofsSnapshot.Manifest.Disk.Size, f.config.EROFSSnapshotDir, erofsSnapshot.Manifest.ID)
+		if nativeOverlay != nil {
+			native.closeDisk = nativeOverlay.Close
+			discardStartup = nativeOverlay.discard
+		}
+		if overlayErr != nil {
+			return nil, overlayErr
+		}
+	}
+
 	// Identity shared by everything this resume logs on the sandbox's behalf:
 	// the uffd backend (and its serve loop) and the prefetcher.
 	sbxLogger := runtime.Logger()
@@ -1251,6 +1359,9 @@ func (f *Factory) ResumeSandbox(
 	// Uffd initialization
 	fcUffdPath := sandboxFiles.SandboxUffdSocketPath()
 	uffdPromise := utils.NewPromise(func() (*uffd.Uffd, error) {
+		if nativeMemory {
+			return nil, nil
+		}
 		memfile, err := t.Memfile(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get memfile: %w", err)
@@ -1282,6 +1393,9 @@ func (f *Factory) ResumeSandbox(
 	})
 
 	go func() {
+		if nativeMemory {
+			return
+		}
 		memfile, err := t.Memfile(ctx)
 		if err != nil {
 			return
@@ -1379,6 +1493,9 @@ func (f *Factory) ResumeSandbox(
 
 	// Rootfs initialization
 	overlayPromise := utils.NewPromise(func() (rootfs.Provider, error) {
+		if nativeMemory {
+			return nativeOverlay, nil
+		}
 		readonlyRootfs, err := t.Rootfs()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get rootfs: %w", err)
@@ -1413,6 +1530,9 @@ func (f *Factory) ResumeSandbox(
 
 	// Memory initialization
 	memoryPromise := utils.NewPromise(func() (struct{}, error) {
+		if nativeMemory {
+			return struct{}{}, nil
+		}
 		fcUffd, err := uffdPromise.Wait(ctx)
 		if err != nil {
 			return struct{}{}, err
@@ -1463,9 +1583,13 @@ func (f *Factory) ResumeSandbox(
 	}
 	// ==== END of resources initialization ====
 
-	rootfs, err := t.Rootfs()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get rootfs overlay: %w", err)
+	rootfsBuildID := t.Files().BuildID
+	if !nativeMemory {
+		rootfs, err := t.Rootfs()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get rootfs overlay: %w", err)
+		}
+		rootfsBuildID = rootfs.Header().Metadata.BaseBuildId.String()
 	}
 
 	meta, err := t.Metadata()
@@ -1533,13 +1657,16 @@ func (f *Factory) ResumeSandbox(
 		fc.RootfsPaths{
 			TemplateVersion: meta.Version,
 			TemplateID:      config.BaseTemplateID,
-			BuildID:         rootfs.Header().Metadata.BaseBuildId.String(),
+			BuildID:         rootfsBuildID,
 		},
 	)
 	if fcErr != nil {
 		return nil, fmt.Errorf("failed to create FC: %w", fcErr)
 	}
 
+	if native != nil {
+		native.process = fcHandle
+	}
 	resumeThrottleConfig := featureflags.GetTCPFirewallEgressThrottleConfig(ctx, f.featureFlags)
 	resumeDriveThrottleConfig := featureflags.GetBlockDriveThrottleConfig(ctx, f.featureFlags)
 
@@ -1558,10 +1685,14 @@ func (f *Factory) ResumeSandbox(
 		return nil, fmt.Errorf("failed to get uffd: %w", err)
 	}
 
+	var memoryBackend uffd.MemoryBackend = fcUffd
+	if nativeMemory {
+		memoryBackend = uffd.NewFileMemory()
+	}
 	resources := &Resources{
 		Slot:   ips,
 		rootfs: overlay,
-		memory: fcUffd,
+		memory: memoryBackend,
 	}
 
 	metadata := &Metadata{
@@ -1577,6 +1708,7 @@ func (f *Factory) ResumeSandbox(
 	}
 
 	sbx := &Sandbox{
+		nativeResources:    native,
 		LifecycleID:        lifecycleID,
 		LifecycleStartedAt: time.Now().UTC(),
 
@@ -1603,7 +1735,7 @@ func (f *Factory) ResumeSandbox(
 		skipStartupMetrics: !ropts.describesCustomerStart(),
 	}
 
-	useMemfd := fc.FCSupportsMemfd(config.FirecrackerConfig.FirecrackerVersion) &&
+	useMemfd := !nativeMemory && fc.FCSupportsMemfd(config.FirecrackerConfig.FirecrackerVersion) &&
 		f.featureFlags.BoolFlag(ctx, featureflags.UseMemFdFlag, sandboxLDContext(runtime, config))
 
 	// Synchronous WP fault delivery (vs the kernel's in-place WP_ASYNC clears).
@@ -1611,13 +1743,13 @@ func (f *Factory) ResumeSandbox(
 	// The operator must only enable the flag where the deployed FC accepts
 	// use_sync_wp: FC's MemBackendConfig is deny_unknown_fields, so a mismatch
 	// fails the snapshot load loudly instead of silently downgrading.
-	useSyncWP := f.featureFlags.BoolFlag(ctx, featureflags.UseSyncWPFlag, sandboxLDContext(runtime, config))
+	useSyncWP := !nativeMemory && f.featureFlags.BoolFlag(ctx, featureflags.UseSyncWPFlag, sandboxLDContext(runtime, config))
 	// Throwaway resumes (e.g. the pause-resume prefetch harvest) promise "no
 	// per-sandbox metrics" and never pause, so counting them would inflate the
 	// wp_mode denominator with resumes that can never contribute wp_resolve or
 	// divergence samples — the same rule, and now the same predicate, as the
 	// other start-population counters.
-	if ropts.describesCustomerStart() {
+	if !nativeMemory && ropts.describesCustomerStart() {
 		wpMode := "async"
 		if useSyncWP {
 			wpMode = "sync"
@@ -1630,7 +1762,9 @@ func (f *Factory) ResumeSandbox(
 	sbx.envdWorkdirWithheld = workdirWithheld
 	// The backend records its own mode so DiffMetadata can refuse the
 	// tracker dirty source for a WP_ASYNC sandbox (fail closed).
-	fcUffd.SetSyncWP(useSyncWP)
+	if fcUffd != nil {
+		fcUffd.SetSyncWP(useSyncWP)
+	}
 
 	// Part of the sandbox as we need to stop Checks before pausing the sandbox
 	// This is to prevent race condition of reporting unhealthy sandbox
@@ -1676,36 +1810,46 @@ func (f *Factory) ResumeSandbox(
 		return nil
 	})
 
-	uffdStartCtx, cancelUffdStartCtx := context.WithCancelCause(ctx)
-	defer cancelUffdStartCtx(errors.New("uffd finished starting"))
-	go func() {
-		uffdWaitErr := fcUffd.Exit().Wait()
+	var fcStartErr error
+	if nativeMemory {
+		fcStartErr = fcHandle.ResumeFile(ctx, sbxlogger.SandboxMetadata{
+			SandboxID: runtime.SandboxID, TemplateID: runtime.TemplateID, TeamID: runtime.TeamID,
+		}, mounted.MemoryPath, snapfile, config.Envd.AccessToken, cgroupFD,
+			fc.RateLimiterConfig{Ops: fc.TokenBucketConfig(resumeThrottleConfig.Ops), Bandwidth: fc.TokenBucketConfig(resumeThrottleConfig.Bandwidth)},
+			fc.RateLimiterConfig{Ops: fc.TokenBucketConfig(resumeDriveThrottleConfig.Ops), Bandwidth: fc.TokenBucketConfig(resumeDriveThrottleConfig.Bandwidth)})
+	} else {
+		uffdStartCtx, cancelUffdStartCtx := context.WithCancelCause(ctx)
+		defer cancelUffdStartCtx(errors.New("uffd finished starting"))
+		go func() {
+			uffdWaitErr := memoryBackend.Exit().Wait()
 
-		cancelUffdStartCtx(fmt.Errorf("uffd process exited: %w", errors.Join(uffdWaitErr, context.Cause(uffdStartCtx))))
-	}()
-	fcStartErr := fcHandle.Resume(
-		uffdStartCtx,
-		sbxlogger.SandboxMetadata{
-			SandboxID:  runtime.SandboxID,
-			TemplateID: runtime.TemplateID,
-			TeamID:     runtime.TeamID,
-		},
-		fcUffdPath,
-		snapfile,
-		fcUffd.Ready(),
-		config.Envd.AccessToken,
-		cgroupFD,
-		useMemfd,
-		useSyncWP,
-		fc.RateLimiterConfig{
-			Ops:       fc.TokenBucketConfig(resumeThrottleConfig.Ops),
-			Bandwidth: fc.TokenBucketConfig(resumeThrottleConfig.Bandwidth),
-		},
-		fc.RateLimiterConfig{
-			Ops:       fc.TokenBucketConfig(resumeDriveThrottleConfig.Ops),
-			Bandwidth: fc.TokenBucketConfig(resumeDriveThrottleConfig.Bandwidth),
-		},
-	)
+			cancelUffdStartCtx(fmt.Errorf("uffd process exited: %w", errors.Join(uffdWaitErr, context.Cause(uffdStartCtx))))
+		}()
+		fcStartErr = fcHandle.Resume(
+			uffdStartCtx,
+			sbxlogger.SandboxMetadata{
+				SandboxID:  runtime.SandboxID,
+				TemplateID: runtime.TemplateID,
+				TeamID:     runtime.TeamID,
+			},
+			fcUffdPath,
+			snapfile,
+			fcUffd.Ready(),
+			config.Envd.AccessToken,
+			cgroupFD,
+			useMemfd,
+			useSyncWP,
+			fc.RateLimiterConfig{
+				Ops:       fc.TokenBucketConfig(resumeThrottleConfig.Ops),
+				Bandwidth: fc.TokenBucketConfig(resumeThrottleConfig.Bandwidth),
+			},
+			fc.RateLimiterConfig{
+				Ops:       fc.TokenBucketConfig(resumeDriveThrottleConfig.Ops),
+				Bandwidth: fc.TokenBucketConfig(resumeDriveThrottleConfig.Bandwidth),
+			},
+		)
+
+	}
 
 	if fcStartErr != nil {
 		return nil, fmt.Errorf("failed to start FC: %w", fcStartErr)
@@ -1751,17 +1895,20 @@ func (f *Factory) ResumeSandbox(
 		ctx, span := tracer.Start(execCtx, "sandbox-exit-wait")
 		defer span.End()
 
-		// Wait for either uffd or fc process to exit
+		// A native disk backend failure terminates the VM rather than leaving
+		// a running sandbox whose block requests can only fail with EIO.
+		diskDone, diskErr := rootfsExit(overlay)
 		select {
-		case <-fcUffd.Exit().Done():
+		case <-diskDone:
+		case <-memoryBackend.Exit().Done():
 		case <-fcHandle.Exit.Done():
 		}
 
 		err := sbx.Stop(ctx)
 
-		uffdWaitErr := fcUffd.Exit().Wait()
+		uffdWaitErr := memoryBackend.Exit().Wait()
 		fcErr := fcHandle.Exit.Wait()
-		exit.SetError(errors.Join(err, fcErr, uffdWaitErr))
+		exit.SetError(errors.Join(err, fcErr, uffdWaitErr, diskErr()))
 	}()
 
 	return sbx, nil
@@ -1785,6 +1932,21 @@ func (s *Sandbox) Wait(ctx context.Context) error {
 }
 
 func (s *Sandbox) Close(ctx context.Context) error {
+	if s.Config.FirecrackerConfig.NativeMemory {
+		// Match Cleanup.Run: a cancelled caller must not abandon teardown.
+		cleanupCtx := context.WithoutCancel(ctx)
+		s.nativeCaptureMu.Lock()
+		defer s.nativeCaptureMu.Unlock()
+		if err := s.retainNativeCapture(cleanupCtx); err != nil {
+			return err
+		}
+		if err := s.nativeResources.closeUntilDone(cleanupCtx); err != nil {
+			return err
+		}
+		if err := s.cleanupNativeInputs(cleanupCtx); err != nil {
+			return err
+		}
+	}
 	err := s.cleanup.Run(ctx)
 	if s.sandboxes != nil {
 		s.sandboxes.MarkStopped(context.WithoutCancel(ctx), s)
@@ -1846,6 +2008,9 @@ func (s *Sandbox) doStop(ctx context.Context) error {
 func (s *Sandbox) Shutdown(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "shutdown sandbox")
 	defer span.End()
+	if s.UsesEROFS() {
+		return s.shutdownNative(ctx)
+	}
 
 	// Stop the health check before pausing the VM
 	s.Checks.Stop()
@@ -1948,6 +2113,13 @@ func (s *Sandbox) Pause(
 	var pauseOpts pauseOptions
 	for _, opt := range opts {
 		opt(&pauseOpts)
+	}
+
+	if s.Config.FirecrackerConfig.NativeMemory {
+		if pauseOpts.maintainSandbox || pauseOpts.filesystemSnapshot {
+			return nil, errors.New("EROFS snapshots require full VM state and resume-fresh checkpoint")
+		}
+		return s.pauseEROFS(ctx, m)
 	}
 
 	ctx, span := tracer.Start(ctx, "sandbox-snapshot", trace.WithAttributes(
@@ -4138,14 +4310,16 @@ func (s *Sandbox) WaitForEnvd(
 			// ServeStats() is cumulative since resume, so at this instant it equals
 			// the startup counts. Recorded for both outcomes (success label) so
 			// slow/failed starts can be correlated with page volume.
-			stats := s.memory.ServeStats()
-			startupAttrs := metric.WithAttributes(
-				attribute.String("start_type", string(startType)),
-				attribute.Bool("success", e == nil),
-			)
-			uffdStartupPagesHistogram.Record(ctx, stats.Pages, startupAttrs)
-			uffdStartupSourcePagesHistogram.Record(ctx, stats.SourcePages, startupAttrs)
-			uffdStartupBytesHistogram.Record(ctx, stats.Bytes, startupAttrs)
+			if !s.Config.FirecrackerConfig.NativeMemory {
+				stats := s.memory.ServeStats()
+				startupAttrs := metric.WithAttributes(
+					attribute.String("start_type", string(startType)),
+					attribute.Bool("success", e == nil),
+				)
+				uffdStartupPagesHistogram.Record(ctx, stats.Pages, startupAttrs)
+				uffdStartupSourcePagesHistogram.Record(ctx, stats.SourcePages, startupAttrs)
+				uffdStartupBytesHistogram.Record(ctx, stats.Bytes, startupAttrs)
+			}
 		}
 
 		if e != nil {

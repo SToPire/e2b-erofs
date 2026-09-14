@@ -45,15 +45,19 @@ var (
 	// ARGV[3] = transition key TTL in seconds
 	// ARGV[4] = result key TTL in seconds
 	// ARGV[5] = expected execution ID, or "" to write unconditionally
+	// ARGV[6] = expected checkpoint build ID, or "" for other removals
 	startTransitionScript = redis.NewScript(`
-		if ARGV[5] ~= '' then
+		if ARGV[5] ~= '' or (ARGV[6] and ARGV[6] ~= '') then
 			local current = redis.call('GET', KEYS[1])
 			if not current then
 				return 0
 			end
 			local ok, decoded = pcall(cjson.decode, current)
-			if not ok or decoded['executionID'] ~= ARGV[5] then
+			if not ok or (ARGV[5] ~= '' and decoded['executionID'] ~= ARGV[5]) then
 				return 0
+			end
+			if ARGV[6] and ARGV[6] ~= '' and decoded['checkpointBuildID'] ~= ARGV[6] then
+				return -1
 			end
 		end
 		redis.call('SET', KEYS[1], ARGV[1])

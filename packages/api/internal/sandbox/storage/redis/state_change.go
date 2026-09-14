@@ -84,6 +84,9 @@ func (s *Storage) StartRemoving(ctx context.Context, teamID uuid.UUID, sandboxID
 			sandboxID, sbx.ExecutionID, opts.ExpectExecutionID, sandboxtypes.ErrExecutionMismatch,
 		)
 	}
+	if opts.ExpectCheckpointBuildID != "" && sbx.CheckpointBuildID != opts.ExpectCheckpointBuildID {
+		return sbx, false, nil, sandboxtypes.ErrCheckpointMismatch
+	}
 
 	// Check if there's an existing transition
 	transactionID, err := s.redisClient.Get(ctx, transitionKey).Result()
@@ -145,6 +148,7 @@ func (s *Storage) StartRemoving(ctx context.Context, teamID uuid.UUID, sandboxID
 
 	// Generate transition ID
 	transitionID := uuid.New().String()
+	updated.TransitionID = transitionID
 	resultKey := getTransitionResultKey(teamID.String(), sandboxID, transitionID)
 
 	// Use atomic Lua script to update sandbox and set transition key with UUID
@@ -153,10 +157,13 @@ func (s *Storage) StartRemoving(ctx context.Context, teamID uuid.UUID, sandboxID
 
 	written, err := startTransitionScript.Run(ctx, s.redisClient,
 		[]string{key, transitionKey, resultKey},
-		newData, transitionID, ttlSeconds, resultTtlSeconds, opts.ExpectExecutionID,
+		newData, transitionID, ttlSeconds, resultTtlSeconds, opts.ExpectExecutionID, opts.ExpectCheckpointBuildID,
 	).Int64()
 	if err != nil {
 		return sbx, false, nil, fmt.Errorf("failed to update sandbox state: %w", err)
+	}
+	if written == -1 {
+		return sbx, false, nil, sandboxtypes.ErrCheckpointMismatch
 	}
 	if written == 0 {
 		// The pin no longer holds. Add is lockless, so the incarnation can have
@@ -218,7 +225,7 @@ func (s *Storage) createCallback(teamID uuid.UUID, sandboxID, transitionKey, res
 		}
 
 		// Delete transition key
-		delErr := s.redisClient.Del(cbCtx, transitionKey).Err()
+		delErr := deleteTransitionIfOwnedScript.Run(cbCtx, s.redisClient, []string{transitionKey}, transitionID).Err()
 		if delErr != nil {
 			logger.L().Warn(cbCtx, "Failed to delete transition key", logger.WithSandboxID(sandboxID), zap.Error(delErr))
 		}

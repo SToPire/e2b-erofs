@@ -159,7 +159,8 @@ type Process struct {
 
 	Exit *utils.ErrorOnce
 
-	client *apiClient
+	client           *apiClient
+	nativeMemorySize int64
 
 	// balloonAccum is the cumulative virtio-balloon snapshot summed by the
 	// metrics-reader goroutine (FC's SharedIncMetric resets per flush).
@@ -180,6 +181,10 @@ func NewProcess(
 		attribute.Int("sandbox.slot.index", slot.Idx),
 	))
 	defer childSpan.End()
+
+	if versions.NativeMemory && !config.EROFSNativeMemoryVerified {
+		return nil, errors.New("native File memory requires a verified Firecracker binary and staging filesystem")
+	}
 
 	// Build the firecracker start script and get computed paths
 	startBuilder := NewStartScriptBuilder(config)
@@ -342,6 +347,13 @@ func (p *Process) Create(
 	ctx, childSpan := tracer.Start(ctx, "create-fc")
 	defer childSpan.End()
 
+	if p.Versions.NativeMemory {
+		p.nativeMemorySize = memoryMB * 1024 * 1024
+		hugePages = false
+		freePageReporting = false
+		freePageHinting = false
+	}
+
 	// Symlink /dev/null to the rootfs link path, so we can start the FC process without the rootfs and then symlink the real rootfs.
 	err := utils.SymlinkForce("/dev/null", p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
 	if err != nil {
@@ -418,7 +430,7 @@ func (p *Process) Create(
 	}
 	telemetry.ReportEvent(ctx, "set fc network config")
 
-	err = p.client.setMachineConfig(ctx, vCPUCount, memoryMB, hugePages)
+	err = p.client.setMachineConfig(ctx, vCPUCount, memoryMB, hugePages, p.Versions.NativeMemory)
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -509,6 +521,56 @@ func (p *Process) Resume(
 	txRateLimit RateLimiterConfig,
 	driveRateLimit RateLimiterConfig,
 ) error {
+	if p.Versions.NativeMemory {
+		return errors.New("native memory requires ResumeFile")
+	}
+
+	return p.resume(ctx, sbxMetadata, uffdSocketPath, snapfile, uffdReady, accessToken,
+		cgroupFD, useMemfd, useSyncWP, txRateLimit, driveRateLimit, "")
+}
+
+// ResumeFile restores ordinary-page RAM from an immutable complete memfile.
+// The caller holds the file's mount and backing dependencies until Stop returns.
+func (p *Process) ResumeFile(
+	ctx context.Context,
+	sbxMetadata sbxlogger.SandboxMetadata,
+	memfilePath string,
+	snapfile template.File,
+	accessToken *string,
+	cgroupFD int,
+	txRateLimit RateLimiterConfig,
+	driveRateLimit RateLimiterConfig,
+) error {
+	if !p.Versions.NativeMemory {
+		return errors.New("File restore requires native memory configuration")
+	}
+	info, err := os.Stat(memfilePath)
+	if err != nil {
+		return fmt.Errorf("inspect File restore memfile: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size()%nativePageSize != 0 {
+		return errors.New("File restore requires a nonempty page-aligned regular memfile")
+	}
+	p.nativeMemorySize = info.Size()
+
+	return p.resume(ctx, sbxMetadata, "", snapfile, nil, accessToken,
+		cgroupFD, false, false, txRateLimit, driveRateLimit, memfilePath)
+}
+
+func (p *Process) resume(
+	ctx context.Context,
+	sbxMetadata sbxlogger.SandboxMetadata,
+	uffdSocketPath string,
+	snapfile template.File,
+	uffdReady chan struct{},
+	accessToken *string,
+	cgroupFD int,
+	useMemfd bool,
+	useSyncWP bool,
+	txRateLimit RateLimiterConfig,
+	driveRateLimit RateLimiterConfig,
+	memfilePath string,
+) error {
 	ctx, span := tracer.Start(ctx, "resume-fc")
 	defer span.End()
 
@@ -538,19 +600,21 @@ func (p *Process) Resume(
 		return nil
 	})
 
-	eg.Go(func() error {
-		ctx, uffdSpan := tracer.Start(egCtx, "wait-uffd-socket")
-		err := socket.Wait(ctx, uffdSocketPath)
-		uffdSpan.End()
+	if !p.Versions.NativeMemory {
+		eg.Go(func() error {
+			ctx, uffdSpan := tracer.Start(egCtx, "wait-uffd-socket")
+			err := socket.Wait(ctx, uffdSocketPath)
+			uffdSpan.End()
 
-		if err != nil {
-			return fmt.Errorf("error waiting for uffd socket: %w", err)
-		}
+			if err != nil {
+				return fmt.Errorf("error waiting for uffd socket: %w", err)
+			}
 
-		telemetry.ReportEvent(egCtx, "uffd socket ready")
+			telemetry.ReportEvent(egCtx, "uffd socket ready")
 
-		return nil
-	})
+			return nil
+		})
+	}
 
 	eg.Go(func() error {
 		_, rootfsSpan := tracer.Start(egCtx, "wait-rootfs-path")
@@ -589,18 +653,28 @@ func (p *Process) Resume(
 	}
 	telemetry.ReportEvent(ctx, "set fc metrics")
 
-	err = p.client.loadSnapshot(
-		ctx,
-		uffdSocketPath,
-		uffdReady,
-		snapfile,
-		useMemfd,
-		useSyncWP,
-	)
+	if p.Versions.NativeMemory {
+		err = p.client.loadFileSnapshot(ctx, memfilePath, snapfile.Path())
+	} else {
+		err = p.client.loadSnapshot(
+			ctx,
+			uffdSocketPath,
+			uffdReady,
+			snapfile,
+			useMemfd,
+			useSyncWP,
+		)
+	}
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
 		return errors.Join(fmt.Errorf("error loading snapshot: %w", err), fcStopErr)
+	}
+
+	if p.Versions.NativeMemory {
+		if err := p.client.validateNativeMemory(ctx); err != nil {
+			return errors.Join(err, p.Stop(ctx))
+		}
 	}
 
 	// Always apply/reset rate limits before resuming so any limits
@@ -776,6 +850,9 @@ func (p *Process) ResumeFreePageReporting(ctx context.Context) error {
 // DrainBalloon triggers a free-page-hinting run and blocks until the cycle
 // completes or ctx fires. No-op on FC < v1.14 and when no balloon is configured.
 func (p *Process) DrainBalloon(ctx context.Context) error {
+	if p.Versions.NativeMemory {
+		return nil
+	}
 	ctx, span := tracer.Start(ctx, "drain-balloon")
 	outcome := "ok"
 	defer func() {
@@ -837,6 +914,9 @@ func pollFphDone(ctx context.Context, describe func(ctx context.Context) (int64,
 
 // CreateSnapshot VM needs to be paused before creating a snapshot.
 func (p *Process) CreateSnapshot(ctx context.Context, snapfilePath string) error {
+	if p.Versions.NativeMemory {
+		return ErrNativeMemoryUnsupported
+	}
 	ctx, childSpan := tracer.Start(ctx, "create-snapshot-fc")
 	defer childSpan.End()
 

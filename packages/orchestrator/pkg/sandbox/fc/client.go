@@ -369,6 +369,7 @@ func (c *apiClient) setMachineConfig(
 	vCPUCount int64,
 	memoryMB int64,
 	hugePages bool,
+	trackDirtyPages bool,
 ) error {
 	// SMT (Simultaneous Multi-Threading / Hyper-Threading) must be disabled on
 	// ARM64 because ARM processors use a different core topology (big.LITTLE,
@@ -378,7 +379,6 @@ func (c *apiClient) setMachineConfig(
 	// We use runtime.GOARCH (not TARGET_ARCH) because the orchestrator binary
 	// always runs on the same architecture as Firecracker.
 	smt := runtime.GOARCH != archARM64
-	trackDirtyPages := false
 	machineConfig := &models.MachineConfiguration{
 		VcpuCount:       &vCPUCount,
 		MemSizeMib:      &memoryMB,

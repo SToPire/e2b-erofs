@@ -68,8 +68,49 @@ func WithRootfsCachePath(rootfsCachePath string) CreateSandboxOption {
 // modify filesystem on the host side.
 func WithPreBootFn(fn sandbox.PreBootFn) CreateSandboxOption {
 	return func(opts *createSandboxOptions) {
-		opts.preBootFn = fn
+		previous := opts.preBootFn
+		opts.preBootFn = func(ctx context.Context, path string) error {
+			if previous != nil {
+				if err := previous(ctx, path); err != nil {
+					return err
+				}
+			}
+			if fn != nil {
+				return fn(ctx, path)
+			}
+			return nil
+		}
 	}
+}
+
+// WithMinimumFreeDisk checks a writable cold-boot disk after user steps and
+// before finalize starts. Journal recovery runs on the new private disk, never
+// on the immutable EROFS parent. EROFS snapshot chains cannot grow their disk.
+func WithMinimumFreeDisk(requiredMB, blockSize int64) CreateSandboxOption {
+	return WithPreBootFn(func(ctx context.Context, path string) error {
+		if requiredMB < 0 {
+			return errors.New("negative minimum free disk space")
+		}
+		if _, err := filesystem.ReplayJournal(ctx, path); err != nil {
+			return fmt.Errorf("replay journal before checking free disk space: %w", err)
+		}
+		free, err := filesystem.GetFreeSpace(ctx, path, blockSize)
+		if err != nil {
+			return err
+		}
+		if free < units.MBToBytes(requiredMB) {
+			return &InsufficientFreeDiskError{FreeMB: units.BytesToMB(free), RequiredMB: requiredMB}
+		}
+		return nil
+	})
+}
+
+type InsufficientFreeDiskError struct {
+	FreeMB, RequiredMB int64
+}
+
+func (e *InsufficientFreeDiskError) Error() string {
+	return fmt.Sprintf("fixed EROFS disk has %d MiB free, requires %d MiB; rebuild with more initial disk space", e.FreeMB, e.RequiredMB)
 }
 
 // ReservedBlocksOptions returns CreateSandboxOption(s) that set reserved blocks

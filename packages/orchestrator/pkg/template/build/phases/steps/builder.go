@@ -177,6 +177,7 @@ func (sb *StepBuilder) Build(
 		},
 
 		FirecrackerConfig: fc.Config{
+			NativeMemory:       sb.BuilderConfig.EROFSSnapshotDir != "",
 			KernelVersion:      sb.Config.KernelVersion,
 			FirecrackerVersion: sb.Config.FirecrackerVersion,
 		},

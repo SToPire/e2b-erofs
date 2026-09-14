@@ -20,10 +20,16 @@ import (
 // The dirty field represents mincore resident pages—essentially pages that were faulted in.
 // The empty field represents pages that are *resident*, but also completely empty.
 func (p *Process) MemoryInfo(ctx context.Context, blockSize int64) (*header.DiffMetadata, error) {
+	if p.Versions.NativeMemory {
+		return nil, ErrNativeMemoryUnsupported
+	}
 	return p.client.memoryInfo(ctx, blockSize)
 }
 
 func (p *Process) DirtyMemory(ctx context.Context, blockSize int64) (*header.DiffMetadata, error) {
+	if p.Versions.NativeMemory {
+		return nil, ErrNativeMemoryUnsupported
+	}
 	return p.client.dirtyMemory(ctx, blockSize)
 }
 
@@ -96,6 +102,10 @@ func (p *Process) ExportMemory(
 			logger.L().Warn(ctx, "set metaOut error", zap.Error(setErr))
 		}
 	}()
+
+	if p.Versions.NativeMemory {
+		return nil, ErrNativeMemoryUnsupported
+	}
 
 	inputMeta := &header.DiffMetadata{Dirty: include, Empty: inputEmpty, BlockSize: blockSize}
 	// In-place snapshot: the running VM still owns the memfd, so copy the dirty

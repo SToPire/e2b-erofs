@@ -295,6 +295,24 @@ func (lb *LayerExecutor) UploadSnapshot(
 	buildOrigin storage.ObjectOrigin,
 ) error {
 	userLogger.Debug(ctx, fmt.Sprintf("Adding layer to cache: %s", meta.Template.BuildID))
+	if snapshot.LocalEROFS != nil {
+		if lb.BuilderConfig.EROFSSnapshotDir == "" || snapshot.LocalEROFS.Manifest.ID != meta.Template.BuildID {
+			return errors.New("EROFS snapshot does not match the configured local build")
+		}
+		// Pause already committed the complete generation. Validate it through
+		// the local index before publishing its recipe; no remote header/data
+		// artifacts exist for this format.
+		if _, err := lb.index.Cached(ctx, meta.Template.BuildID); err != nil {
+			return fmt.Errorf("validate committed EROFS layer: %w", err)
+		}
+		if err := lb.index.SaveLayerMeta(ctx, hash, cache.LayerMetadata{Template: cache.Template{BuildID: meta.Template.BuildID}}); err != nil {
+			return fmt.Errorf("cache local EROFS layer: %w", err)
+		}
+		return snapshot.Close(context.WithoutCancel(ctx))
+	}
+	if lb.BuilderConfig.EROFSSnapshotDir != "" {
+		return errors.New("EROFS build produced a legacy snapshot")
+	}
 
 	// Add snapshot to template cache so it can be used immediately
 	err := lb.templateCache.AddSnapshot(
