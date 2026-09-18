@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -161,6 +162,12 @@ type Process struct {
 
 	client           *apiClient
 	nativeMemorySize int64
+	nativeMemoryHost string
+	nativeMemoryPath string
+	initramfsPath    string
+	pmem             *preparedPmemRootfs
+	rawBuildDisk     bool
+	lifecycleID      string
 
 	// balloonAccum is the cumulative virtio-balloon snapshot summed by the
 	// metrics-reader goroutine (FC's SharedIncMetric resets per flush).
@@ -176,6 +183,7 @@ func NewProcess(
 	versions Config,
 	rootfsProvider rootfs.Provider,
 	rootfsPaths RootfsPaths,
+	memorySources ...RuntimeSources,
 ) (*Process, error) {
 	ctx, childSpan := tracer.Start(ctx, "initialize-fc", trace.WithAttributes(
 		attribute.Int("sandbox.slot.index", slot.Idx),
@@ -188,7 +196,7 @@ func NewProcess(
 
 	// Build the firecracker start script and get computed paths
 	startBuilder := NewStartScriptBuilder(config)
-	startScript, err := startBuilder.Build(versions, files, rootfsPaths, slot.NamespaceID())
+	startScript, err := startBuilder.Build(versions, files, rootfsPaths, slot.NamespaceID(), memorySources...)
 	if err != nil {
 		return nil, err
 	}
@@ -228,8 +236,19 @@ func NewProcess(
 		files:                 files,
 		slot:                  slot,
 
-		kernelPath: startScript.KernelPath,
-		rootfsPath: startScript.RootfsPath,
+		kernelPath:       startScript.KernelPath,
+		rootfsPath:       startScript.RootfsPath,
+		nativeMemoryPath: startScript.MemoryPath,
+		initramfsPath:    startScript.InitramfsPath,
+		pmem:             startScript.pmem,
+	}
+	if len(memorySources) == 1 {
+		p.nativeMemoryHost = memorySources[0].MemoryPath
+		p.rawBuildDisk = memorySources[0].RawDisk
+		p.lifecycleID = memorySources[0].LifecycleID
+	}
+	if p.pmem != nil && p.lifecycleID == "" {
+		return nil, errors.New("pmem runtime requires a lifecycle identity")
 	}
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -355,9 +374,12 @@ func (p *Process) Create(
 	}
 
 	// Symlink /dev/null to the rootfs link path, so we can start the FC process without the rootfs and then symlink the real rootfs.
-	err := utils.SymlinkForce("/dev/null", p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
-	if err != nil {
-		return fmt.Errorf("error symlinking rootfs: %w", err)
+	var err error
+	if p.pmem == nil {
+		err = utils.SymlinkForce("/dev/null", p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
+		if err != nil {
+			return fmt.Errorf("error symlinking rootfs: %w", err)
+		}
 	}
 
 	err = p.configure(
@@ -388,8 +410,18 @@ func (p *Process) Create(
 
 	// IPv4 configuration - format: [local_ip]::[gateway_ip]:[netmask]:hostname:iface:dhcp_option:[dns]
 	ipv4 := fmt.Sprintf("%s::%s:%s:instance:%s:off:%s", p.slot.NamespaceIP(), p.slot.TapIPString(), p.slot.TapMaskString(), p.slot.VpeerName(), p.slot.TapName())
-	kernelArgs := buildKernelArgs(ipv4, options).String()
-	err = p.client.setBootSource(ctx, kernelArgs, p.kernelPath)
+	args := buildKernelArgs(ipv4, options)
+	if p.pmem != nil {
+		if err := p.validatePmemBindings(); err != nil {
+			return errors.Join(err, p.Stop(ctx))
+		}
+		args, err = p.pmem.kernelArgs(args, options.InitScriptPath)
+		if err != nil {
+			return errors.Join(err, p.Stop(ctx))
+		}
+	}
+	kernelArgs := args.String()
+	err = p.client.setBootSource(ctx, kernelArgs, p.kernelPath, p.initramfsPath)
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -406,15 +438,19 @@ func (p *Process) Create(
 	}
 	telemetry.ReportEvent(ctx, "got rootfs path")
 
-	err = utils.SymlinkForce(rootfsPath, p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
-	if err != nil {
-		fcStopErr := p.Stop(ctx)
-
-		return errors.Join(fmt.Errorf("error symlinking rootfs: %w", err), fcStopErr)
+	if p.pmem == nil {
+		err = utils.SymlinkForce(rootfsPath, p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
+		if err != nil {
+			return errors.Join(fmt.Errorf("error symlinking rootfs: %w", err), p.Stop(ctx))
+		}
+		telemetry.ReportEvent(ctx, "symlinked rootfs")
+		err = p.client.setRootfsDrive(ctx, p.rootfsPath, options.IoEngine, buildRateLimiter(driveRateLimit), p.rawBuildDisk)
+	} else {
+		err = p.client.setPmemRootfs(ctx, filepath.Join(pmemDeviceDir, "lower.ext4"), p.rootfsPath, buildRateLimiter(driveRateLimit))
+		if err == nil && p.pmem.source.Export != nil {
+			err = p.client.setExportDrive(ctx)
+		}
 	}
-	telemetry.ReportEvent(ctx, "symlinked rootfs")
-
-	err = p.client.setRootfsDrive(ctx, p.rootfsPath, options.IoEngine, buildRateLimiter(driveRateLimit))
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 
@@ -463,13 +499,16 @@ func (p *Process) Create(
 	// same way it does after a memory resume. The MMDS transport is already
 	// configured by setNetworkInterface above. Template-build cold boots leave
 	// AccessToken nil and skip this, preserving their existing behavior.
-	if options.AccessToken != nil {
+	if options.AccessToken != nil || p.pmem != nil {
 		md := sbxMetadata.LoggerMetadata()
 		meta := &MmdsMetadata{
 			SandboxID:            md.SandboxID,
 			TemplateID:           md.TemplateID,
 			LogsCollectorAddress: fmt.Sprintf("http://%s/logs", p.config.NetworkConfig.OrchestratorInSandboxIPAddress),
-			AccessTokenHash:      keys.HashAccessToken(*options.AccessToken),
+			AccessTokenHash:      keys.HashAccessToken(utils.DerefOrDefault(options.AccessToken, "")),
+		}
+		if p.pmem != nil {
+			meta.LifecycleID, meta.RootfsLayout = p.lifecycleID, PmemRootfsLayout
 		}
 		if err := p.client.setMmds(ctx, meta); err != nil {
 			fcStopErr := p.Stop(ctx)
@@ -575,9 +614,12 @@ func (p *Process) resume(
 	defer span.End()
 
 	// Symlink /dev/null to the rootfs link path, so we can start the FC process without the rootfs and then symlink the real rootfs.
-	err := utils.SymlinkForce("/dev/null", p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
-	if err != nil {
-		return fmt.Errorf("error symlinking rootfs: %w", err)
+	var err error
+	if p.pmem == nil {
+		err = utils.SymlinkForce("/dev/null", p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
+		if err != nil {
+			return fmt.Errorf("error symlinking rootfs: %w", err)
+		}
 	}
 
 	// create errgroup with context that handled socket wait + rootfs symlink
@@ -624,6 +666,12 @@ func (p *Process) resume(
 		if err != nil {
 			return fmt.Errorf("error getting rootfs path: %w", err)
 		}
+		if p.pmem != nil {
+			if rootfsPath != p.pmem.source.UpperPath {
+				return errors.New("pmem raw upper provider differs from the prepared source")
+			}
+			return nil
+		}
 
 		err = utils.SymlinkForce(rootfsPath, p.files.SandboxCacheRootfsLinkPath(p.config.StorageConfig))
 		if err != nil {
@@ -653,8 +701,21 @@ func (p *Process) resume(
 	}
 	telemetry.ReportEvent(ctx, "set fc metrics")
 
+	if p.pmem != nil {
+		if p.nativeMemoryPath == "" {
+			return errors.Join(errors.New("pmem restore requires a prepared memfile bind"), p.Stop(ctx))
+		}
+		if err := p.validatePmemBindings(); err != nil {
+			return errors.Join(err, p.Stop(ctx))
+		}
+	}
+
 	if p.Versions.NativeMemory {
-		err = p.client.loadFileSnapshot(ctx, memfilePath, snapfile.Path())
+		var namespacePath string
+		namespacePath, err = p.memoryPathInNamespace(memfilePath)
+		if err == nil {
+			err = p.client.loadFileSnapshot(ctx, namespacePath, snapfile.Path())
+		}
 	} else {
 		err = p.client.loadSnapshot(
 			ctx,
@@ -686,19 +747,12 @@ func (p *Process) resume(
 	}
 	telemetry.ReportEvent(ctx, "configured tx rate limit")
 
-	if setErr := p.client.setDriveRateLimit(ctx, rootfsDriveID, driveRateLimit); setErr != nil {
+	if setErr := p.client.setDriveRateLimit(ctx, p.diskDriveID(), driveRateLimit); setErr != nil {
 		fcStopErr := p.Stop(ctx)
 
 		return errors.Join(fmt.Errorf("error setting drive rate limit: %w", setErr), fcStopErr)
 	}
 	telemetry.ReportEvent(ctx, "configured drive rate limit")
-
-	err = p.client.resumeVM(ctx)
-	if err != nil {
-		fcStopErr := p.Stop(ctx)
-
-		return errors.Join(fmt.Errorf("error resuming vm: %w", err), fcStopErr)
-	}
 
 	meta := &MmdsMetadata{
 		SandboxID:            sbxMetadata.SandboxID,
@@ -711,8 +765,19 @@ func (p *Process) resume(
 	} else {
 		meta.AccessTokenHash = keys.HashAccessToken("")
 	}
+	if p.pmem != nil {
+		meta.LifecycleID, meta.RootfsLayout = p.lifecycleID, PmemRootfsLayout
+		if err := p.client.setMmds(ctx, meta); err != nil {
+			return errors.Join(err, p.Stop(ctx))
+		}
+	}
+	if err := p.client.resumeVM(ctx); err != nil {
+		return errors.Join(fmt.Errorf("error resuming vm: %w", err), p.Stop(ctx))
+	}
 
-	err = p.client.setMmds(ctx, meta)
+	if p.pmem == nil {
+		err = p.client.setMmds(ctx, meta)
+	}
 	if err != nil {
 		fcStopErr := p.Stop(ctx)
 

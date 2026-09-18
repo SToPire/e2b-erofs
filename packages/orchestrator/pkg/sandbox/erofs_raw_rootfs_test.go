@@ -5,7 +5,9 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,6 +33,63 @@ func nativeRawSource(t *testing.T, size int) (*block.Local, []byte) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, source.Close()) })
 	return source, data
+}
+
+func TestV2RawUpperOwnershipAndSeal(t *testing.T) {
+	t.Parallel()
+	store := t.TempDir()
+	parent := filepath.Join(store, "parent.raw")
+	data := bytes.Repeat([]byte{0x35}, 4*erofs.BlockSize)
+	require.NoError(t, os.WriteFile(parent, data, 0600))
+	provider, err := newV2RawRootfs(t.Context(), parent, fmt.Sprintf("%x", sha256.Sum256(data)), int64(len(data)), store)
+	require.NoError(t, err)
+	path, err := provider.Path()
+	require.NoError(t, err)
+	a, err := os.Stat(parent)
+	require.NoError(t, err)
+	b, err := os.Stat(path)
+	require.NoError(t, err)
+	require.False(t, os.SameFile(a, b))
+	changed := bytes.Clone(data)
+	clear(changed[erofs.BlockSize : 2*erofs.BlockSize])
+	require.NoError(t, os.WriteFile(path, changed, 0600))
+	dir := filepath.Join(store, ".captures", "cutoff")
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	target := filepath.Join(dir, "upper.sealed.raw")
+	sealed, err := provider.seal(t.Context(), target)
+	require.NoError(t, err)
+	require.Equal(t, target, sealed)
+	require.NoFileExists(t, path)
+	require.NoError(t, provider.Close(t.Context()))
+	require.NoDirExists(t, filepath.Dir(path))
+	sealed, err = provider.seal(t.Context(), target)
+	require.NoError(t, err)
+	require.Equal(t, target, sealed)
+	actual, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, changed, actual)
+	actual, err = os.ReadFile(parent)
+	require.NoError(t, err)
+	require.Equal(t, data, actual)
+	_, err = newV2RawRootfs(t.Context(), parent, "wrong digest", int64(len(data)), store)
+	require.ErrorContains(t, err, "committed content")
+}
+
+func TestV2RawRecoveryPinSurvivesRuntimeClose(t *testing.T) {
+	store := t.TempDir()
+	data := bytes.Repeat([]byte{0x24}, 4*erofs.BlockSize)
+	parent := filepath.Join(store, "parent.raw")
+	require.NoError(t, os.WriteFile(parent, data, 0600))
+	provider, err := newV2RawRootfs(t.Context(), parent, fmt.Sprintf("%x", sha256.Sum256(data)), int64(len(data)), store)
+	require.NoError(t, err)
+	path, err := provider.Path()
+	require.NoError(t, err)
+	provider.retainForCapture()
+	require.NoError(t, provider.Close(t.Context()))
+	require.FileExists(t, path, "durable recovery must retain the raw source")
+	require.NoError(t, provider.discardRetainedCapture())
+	require.NoFileExists(t, path)
+	require.FileExists(t, parent)
 }
 
 func TestNativeRawSuppliedDiskRemainsCallerOwned(t *testing.T) {
@@ -202,4 +261,20 @@ func TestNativeRawFailedMaterializationRemovesOnlyIncompletePrivateFile(t *testi
 		require.NoError(t, err)
 		require.Equal(t, data, actual)
 	}
+}
+
+func TestNativeRawRetainedBaselineCleanup(t *testing.T) {
+	t.Parallel()
+	source, _ := nativeRawSource(t, 8192)
+	p, err := newNativeRawRootfs(t.Context(), source, "", t.TempDir())
+	require.NoError(t, err)
+	path, err := p.Path()
+	require.NoError(t, err)
+	p.retainForCapture()
+	require.NoError(t, p.Close(t.Context()))
+	require.FileExists(t, path)
+	require.NoError(t, p.discardRetainedCapture())
+	require.NoFileExists(t, path)
+	require.NoError(t, p.discardRetainedCapture())
+	require.FileExists(t, source.Path())
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -112,7 +113,7 @@ func TestNativeCheckpointLostResponseKeepsHealthyRuntime(t *testing.T) {
 	assert.EqualValues(t, 0, f.o.checkpointRedis.HLen(t.Context(), checkpointIntentsKey).Val())
 }
 
-func TestNativeCheckpointClientCancellationReconcilesWithDetachedContext(t *testing.T) {
+func TestNativeCheckpointClientCancellationLeavesIntentForBackgroundReconciliation(t *testing.T) {
 	t.Parallel()
 	f, node := reconciliationFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -122,7 +123,9 @@ func TestNativeCheckpointClientCancellationReconcilesWithDetachedContext(t *test
 		cancel()
 		return status.Error(codes.Canceled, "caller lost completed response")
 	}
-	require.NoError(t, f.o.CheckpointSandbox(ctx, f.sbx.TeamID, f.sbx.SandboxID))
+	require.ErrorIs(t, f.o.CheckpointSandbox(ctx, f.sbx.TeamID, f.sbx.SandboxID), errCheckpointPending)
+	require.Positive(t, f.o.checkpointRedis.HLen(t.Context(), checkpointIntentsKey).Val())
+	f.o.reconcilePendingCheckpoints(t.Context())
 	stored, err := f.o.sandboxStore.Get(t.Context(), f.sbx.TeamID, f.sbx.SandboxID)
 	require.NoError(t, err)
 	assert.Equal(t, sandbox.StateRunning, stored.State)
@@ -130,6 +133,126 @@ func TestNativeCheckpointClientCancellationReconcilesWithDetachedContext(t *test
 	require.NoError(t, err)
 	assert.Equal(t, types.BuildStatusSuccess, last.EnvBuild.Status)
 	assert.Zero(t, node.deleteCount())
+}
+
+func TestNativeCheckpointTransitionReleaseCannotHoldCaller(t *testing.T) {
+	t.Parallel()
+	f, node := reconciliationFixture(t)
+	i, finish := preparedReconciliation(t, f)
+	node.set(orchestrator.CheckpointSnapshotState_CHECKPOINT_SNAPSHOT_COMMITTED, orchestrator.CheckpointRuntimeState_CHECKPOINT_RUNTIME_RUNNING)
+	entered := make(chan context.Context, 1)
+	unblock := make(chan struct{})
+	released := make(chan struct{})
+	defer func() {
+		close(unblock)
+		<-released
+	}()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- f.o.finishNativeCheckpoint(ctx, i, nil, func(releaseCtx context.Context, err error) {
+			entered <- releaseCtx
+			<-unblock
+			finish(releaseCtx, err)
+			close(released)
+		})
+	}()
+	var releaseCtx context.Context
+	select {
+	case releaseCtx = <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transition release did not start")
+	}
+	_, bounded := releaseCtx.Deadline()
+	require.True(t, bounded)
+	cancel()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, errCheckpointPending)
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("caller waited for blocked transition release")
+	}
+	require.NoError(t, releaseCtx.Err(), "release must survive caller cancellation")
+	// Reconciliation cannot run ahead of transition release. The durable intent
+	// and Snapshotting state remain for a later background attempt.
+	require.True(t, f.o.checkpointRedis.HExists(t.Context(), checkpointIntentsKey, i.BuildID.String()).Val())
+	stored, err := f.o.sandboxStore.Get(t.Context(), i.TeamID, i.SandboxID)
+	require.NoError(t, err)
+	require.Equal(t, sandbox.StateSnapshotting, stored.State)
+}
+
+type blockedCheckpointReceipt struct {
+	once    sync.Once
+	entered chan struct{}
+	unblock chan struct{}
+}
+
+func (h *blockedCheckpointReceipt) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *blockedCheckpointReceipt) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *blockedCheckpointReceipt) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, command redis.Cmder) error {
+		if command.Name() == "hset" && len(command.Args()) > 1 && command.Args()[1] == checkpointIntentsKey {
+			// Simulate socket I/O that ignores the context until its own timeout.
+			h.once.Do(func() { close(h.entered); <-h.unblock })
+		}
+		return next(ctx, command)
+	}
+}
+
+func TestNativeCheckpointCallersReturnWhileReceiptIOIsBlocked(t *testing.T) {
+	t.Parallel()
+	for _, template := range []bool{false, true} {
+		t.Run(map[bool]string{false: "sandbox", true: "template"}[template], func(t *testing.T) {
+			t.Parallel()
+			f, node := reconciliationFixture(t)
+			node.checkpoint = func(context.Context, *orchestrator.SandboxCheckpointRequest) error {
+				node.set(orchestrator.CheckpointSnapshotState_CHECKPOINT_SNAPSHOT_COMMITTED, orchestrator.CheckpointRuntimeState_CHECKPOINT_RUNTIME_RUNNING)
+				return nil
+			}
+			hook := &blockedCheckpointReceipt{entered: make(chan struct{}), unblock: make(chan struct{})}
+			f.o.checkpointRedis.AddHook(hook)
+			var unblockOnce sync.Once
+			unblock := func() { unblockOnce.Do(func() { close(hook.unblock) }) }
+			defer unblock()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				if template {
+					_, err := f.o.CreateSnapshotTemplate(ctx, f.sbx.TeamID, f.sbx.SandboxID, SnapshotTemplateOpts{Tag: "default"})
+					result <- err
+				} else {
+					result <- f.o.CheckpointSandbox(ctx, f.sbx.TeamID, f.sbx.SandboxID)
+				}
+			}()
+			select {
+			case <-hook.entered:
+			case err := <-result:
+				t.Fatalf("caller exited before receipt write: %v", err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("receipt write did not start")
+			}
+			cancel()
+			select {
+			case err := <-result:
+				require.ErrorIs(t, err, errCheckpointPending)
+			case <-time.After(time.Second):
+				t.Fatal("caller remained blocked by receipt I/O")
+			}
+			unblock()
+			waitCtx, waitCancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer waitCancel()
+			require.NoError(t, f.o.sandboxStore.WaitForStateChange(waitCtx, f.sbx.TeamID, f.sbx.SandboxID))
+			f.o.reconcilePendingCheckpoints(t.Context())
+			stored, err := f.o.sandboxStore.Get(t.Context(), f.sbx.TeamID, f.sbx.SandboxID)
+			require.NoError(t, err)
+			require.Equal(t, sandbox.StateRunning, stored.State)
+		})
+	}
 }
 
 func TestNativeCheckpointCommittedStoppedRetainsSnapshotAndRemovesRuntime(t *testing.T) {

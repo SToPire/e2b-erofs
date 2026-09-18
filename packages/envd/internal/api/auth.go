@@ -48,6 +48,25 @@ func (a *API) WithAuthorization(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// check if this path is allowed without authentication (e.g., health check, endpoints supporting signing)
 		allowedPath := slices.Contains(authExcludedPaths, req.Method+req.URL.Path)
+		if a.pmem != nil && slices.Contains([]string{"POST/upgrade", "POST/freeze", "POST/unfreeze", "POST/fsfreeze", "POST/fsthaw"}, req.Method+req.URL.Path) {
+			// RAM restore retains the previous initialized bit and token. Control
+			// requests must belong to the MMDS lifecycle already prepared here;
+			// in particular an old /fsthaw cannot reopen readiness after restore.
+			if err := a.validatePmemControl(req); err != nil {
+				jsonError(w, http.StatusForbidden, err)
+				return
+			}
+		}
+		if a.pmem != nil && !a.Initialized() {
+			control := slices.Contains([]string{"POST/init", "GET/health"}, req.Method+req.URL.Path)
+			if a.Authenticated() {
+				control = control || slices.Contains([]string{"POST/upgrade", "POST/freeze", "POST/unfreeze", "POST/fsfreeze", "POST/fsthaw"}, req.Method+req.URL.Path)
+			}
+			if !control {
+				jsonError(w, http.StatusServiceUnavailable, errors.New("rootfs resume has not committed"))
+				return
+			}
+		}
 
 		switch {
 		case a.accessToken.IsSet():

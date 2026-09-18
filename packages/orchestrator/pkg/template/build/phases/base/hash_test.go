@@ -140,3 +140,23 @@ func TestRendersRootfsFiles(t *testing.T) {
 	assert.False(t, rendersRootfsFiles(fromTemplate(envdMemoryContext(true, 4096))),
 		"a build from another template inherits its parent's files and reports nothing about them")
 }
+
+func TestPmemBuildCacheSeparatesLayoutAndUpperCapacity(t *testing.T) {
+	t.Parallel()
+	base := envdMemoryContext(false, 256)
+	legacy := testLayerKey(base)
+	base.BuilderConfig.EROFSNativeOnly = true
+	initial := testLayerKey(base)
+	assert.NotEqual(t, legacy, initial)
+	changed := base
+	changed.Config.FreeDiskSizeMB = 1024
+	assert.NotEqual(t, initial, testLayerKey(changed))
+	changed = base
+	changed.Config.KernelVersion = "new-kernel"
+	assert.NotEqual(t, initial, testLayerKey(changed))
+	changed = base
+	changed.Config.FirecrackerVersion = "new-fc"
+	assert.NotEqual(t, initial, testLayerKey(changed))
+	base.BuilderConfig.EROFSNativeOnly = false
+	assert.Equal(t, legacy, testLayerKey(base))
+}

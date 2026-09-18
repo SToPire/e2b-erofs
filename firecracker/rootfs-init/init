@@ -1,0 +1,119 @@
+#!/bin/busybox sh
+# pmem-overlay-raw-v1: PID 1 until the final template init takes over.
+set -eu
+export PATH=/bin
+bb=/bin/busybox
+
+fatal() {
+    echo "E2B_ROOTFS_ERROR: $*" >/dev/console
+    exit 1
+}
+
+$bb mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+$bb mount -t proc proc /proc
+$bb mount -t sysfs sysfs /sys
+
+layout=
+lower_bytes=
+upper_bytes=
+target_init=/sbin/init
+export_bytes=
+export_nonce=
+for arg in $($bb cat /proc/cmdline); do
+    case "$arg" in
+        e2b.rootfs_layout=*) layout=${arg#*=} ;;
+        e2b.lower_bytes=*) lower_bytes=${arg#*=} ;;
+        e2b.upper_bytes=*) upper_bytes=${arg#*=} ;;
+        e2b.init=*) target_init=${arg#*=} ;;
+        e2b.export_bytes=*) export_bytes=${arg#*=} ;;
+        e2b.export_nonce=*) export_nonce=${arg#*=} ;;
+    esac
+done
+[ "${E2B_EXPORT_ONLY:-0}" != 1 ] || [ -n "$export_bytes" ] || fatal 'missing export descriptor'
+[ "$layout" = pmem-overlay-raw-v1 ] || fatal 'missing or unsupported layout'
+case "$lower_bytes:$upper_bytes" in
+    *[!0-9:]*|:*|*:) fatal 'invalid lower/upper capacity' ;;
+esac
+[ "$lower_bytes" -gt 0 ] && [ "$upper_bytes" -gt 0 ] || fatal 'zero capacity'
+case "$target_init" in
+    /*) ;;
+    *) fatal 'init must be an absolute Guest path' ;;
+esac
+
+attempt=0
+while [ ! -b /dev/pmem0 ] || [ ! -b /dev/vda ]; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -le 100 ] || fatal 'pmem0/vda did not appear'
+    $bb sleep 0.1
+done
+actual_lower=$(( $($bb cat /sys/class/block/pmem0/size) * 512 ))
+actual_upper=$(( $($bb cat /sys/class/block/vda/size) * 512 ))
+[ "$actual_lower" -eq "$lower_bytes" ] || fatal 'lower capacity mismatch'
+[ "$actual_upper" -eq "$upper_bytes" ] || fatal 'upper capacity mismatch'
+
+$bb mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /state
+$bb mkdir -p /state/lower /state/upperfs
+$bb mount -t ext4 -o ro,noload,dax=always /dev/pmem0 /state/lower
+/bin/dax-check dax /state/lower "$target_init" || fatal 'lower did not enable file DAX'
+$bb mount -t ext4 -o rw,noatime /dev/vda /state/upperfs
+# The upper seed is prepared by the builder. Never recreate its work/index tree
+# on resume or conceal a damaged/incompatible image by starting a fresh upper.
+for path in /state/upperfs/upper /state/upperfs/work; do
+    [ -d "$path" ] && [ ! -L "$path" ] || fatal 'invalid upper/work directory'
+done
+fresh_upper=0
+if [ -f /state/upperfs/.e2b-new-upper ]; then
+    fresh_upper=1
+    [ ! -L /state/upperfs/.e2b-new-upper ] || fatal 'invalid upper seed marker'
+    [ "$($bb cat /state/upperfs/.e2b-new-upper)" = root-metadata-v1 ] || fatal 'unknown upper seed marker'
+    /bin/rootfs-copy --root-metadata /state/lower /state/upperfs/upper || fatal 'upper root metadata initialization failed'
+    $bb rm /state/upperfs/.e2b-new-upper
+fi
+options=lowerdir=/state/lower,upperdir=/state/upperfs/upper,workdir=/state/upperfs/work,index=on,metacopy=off,redirect_dir=on,xino=on,nfs_export=off
+$bb mount -t overlay -o "$options" overlay /newroot
+
+# A build-only helper never starts tenant init or restores its RAM. Its upper
+# is an independent copy, so journal replay and OverlayFS index updates here
+# cannot change the source generation. Only a fully unmounted export succeeds.
+if [ -n "$export_bytes" ]; then
+    case "$export_bytes:$export_nonce" in
+        *[!0-9a-f:-]*|:*) fatal 'invalid export descriptor' ;;
+    esac
+    [ "${#export_nonce}" -eq 36 ] || fatal 'invalid export nonce'
+    attempt=0
+    while [ ! -b /dev/vdb ]; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -le 100 ] || fatal 'export vdb did not appear'
+        $bb sleep 0.1
+    done
+    actual_export=$(( $($bb cat /sys/class/block/vdb/size) * 512 ))
+    [ "$actual_export" -eq "$export_bytes" ] || fatal 'export capacity mismatch'
+    $bb mount -t ext4 -o rw,noatime /dev/vdb /export
+    [ ! -d /export/lost+found ] || $bb rmdir /export/lost+found
+    /bin/rootfs-copy /newroot /export || fatal 'merged root export failed'
+    $bb umount /export
+    $bb sync
+    echo "E2B_ROOTFS_EXPORT_OK:$export_nonce"
+    $bb poweroff -f
+    fatal 'export helper did not power off'
+fi
+
+# Keep backing mounts outside /run; systemd may replace /run during boot.
+for path in /newroot/.e2b-rootfs; do
+    [ ! -L "$path" ] || fatal 'reserved mount path is a symlink'
+    $bb mkdir -p "$path"
+done
+/bin/dax-check exec /newroot "$target_init" || fatal 'template init is not executable'
+echo '{"layout":"pmem-overlay-raw-v1","upper_mount":"/.e2b-rootfs/upperfs","lower_mount":"/.e2b-rootfs/lower"}' >/state/layout.json
+$bb mount --move /state /newroot/.e2b-rootfs
+for path in dev proc sys; do
+    [ ! -L "/newroot/$path" ] || fatal 'reserved system mount path is a symlink'
+    $bb mkdir -p "/newroot/$path"
+    $bb mount --move "/$path" "/newroot/$path"
+done
+if [ "$fresh_upper" -eq 1 ]; then
+    /bin/rootfs-copy --root-flags /newroot/.e2b-rootfs/lower /newroot || fatal 'upper root flags initialization failed'
+fi
+echo 'E2B_ROOTFS_READY: pmem-overlay-raw-v1' 
+exec $bb switch_root /newroot "$target_init"

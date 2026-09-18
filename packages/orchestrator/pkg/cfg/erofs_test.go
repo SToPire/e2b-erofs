@@ -32,6 +32,19 @@ func TestEROFSPathsRequireExplicitNativeVerification(t *testing.T) {
 	require.ErrorContains(t, makePathsAbsolute(&c), "EROFS_NATIVE_MEMORY_VERIFIED")
 }
 
+func TestEROFSNativeOnlyRequiresVerifiedPmemStore(t *testing.T) {
+	t.Parallel()
+	for _, config := range []BuilderConfig{
+		{EROFSNativeOnly: true},
+		{EROFSNativeOnly: true, EROFSSnapshotDir: t.TempDir()},
+		{EROFSNativeOnly: true, EROFSSnapshotDir: t.TempDir(), EROFSNativeMemoryVerified: true},
+	} {
+		require.ErrorContains(t, makePathsAbsolute(&config), "EROFS_NATIVE_ONLY")
+	}
+	config := BuilderConfig{EROFSNativeOnly: true, EROFSSnapshotDir: t.TempDir(), EROFSNativeMemoryVerified: true, EROFSPmemVerified: true}
+	require.NoError(t, makePathsAbsolute(&config))
+}
+
 func TestEROFSPathsRejectDisposableAndNamespaceDirectories(t *testing.T) {
 	t.Parallel()
 	for name, set := range erofsExcludedDirectories() {

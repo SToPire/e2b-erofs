@@ -14,12 +14,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Mounted owns the primary and every historical loop device, and both mounts.
+// Mounted owns both file-backed EROFS mounts. The kernel holds references to
+// the primary and historical image files until the mounts are released.
 // Close must follow Firecracker exit and overlay seal, after all consumers have
-// closed their files. Failed unmounts retain the loop ownership for retry.
+// closed their files. Failed unmounts retain ownership for retry.
 type Mounted struct {
 	MemoryPath  string
 	DiskPath    string
+	LowerPath   string
 	VMStatePath string
 	mu          sync.Mutex
 	dir         string
@@ -29,16 +31,18 @@ type Mounted struct {
 type imageMount struct {
 	path    string
 	mounted bool
-	loops   []*os.File
 }
 
 func (s *Snapshot) Mount(ctx context.Context, mountRoot string) (*Mounted, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	verified, err := s.store.Load(s.Manifest.ID)
+	verified, err := s.store.LoadContext(ctx, s.Manifest.ID)
 	if err != nil {
 		return nil, err
+	}
+	if sharedManifestDigest(verified.Manifest) != sharedManifestDigest(s.Manifest) {
+		return nil, ErrSnapshotConflict
 	}
 	// Mount precisely the descriptor just verified, rather than a stale or
 	// caller-modified copy of the exported Manifest field.
@@ -51,78 +55,81 @@ func (s *Snapshot) Mount(ctx context.Context, mountRoot string) (*Mounted, error
 		return nil, err
 	}
 	m := &Mounted{dir: dir, VMStatePath: s.VMStatePath()}
+	writableName, writableTarget := "disk", "disk/rootfs.ext4"
+	if s.Manifest.Format == FormatV2 {
+		writableName, writableTarget = "upper", "upper/upper.ext4"
+	}
 	for _, item := range []struct {
 		name, target string
 		image        Image
 		dest         *string
 	}{
 		{"memory", "memory/memfile", s.Manifest.Memory, &m.MemoryPath},
-		{"disk", "disk/rootfs.ext4", s.Manifest.Disk, &m.DiskPath},
+		{writableName, writableTarget, s.Manifest.WritableDisk(), &m.DiskPath},
 	} {
-		im := &imageMount{path: filepath.Join(dir, item.name)}
-		m.mounts = append(m.mounts, im)
-		if err := os.Mkdir(im.path, 0700); err != nil {
-			return m, errors.Join(err, m.Close())
-		}
-		var devices []string
-		for _, a := range append([]Artifact{item.image.Artifact}, item.image.Devices...) {
-			if err := ctx.Err(); err != nil {
-				return m, errors.Join(err, m.Close())
-			}
-			loop, err := attachLoop(filepath.Join(s.store.Root, a.File))
-			if err != nil {
-				return m, errors.Join(err, m.Close())
-			}
-			im.loops = append(im.loops, loop)
-			devices = append(devices, loop.Name())
-		}
-		var opts []string
-		for _, device := range devices[1:] {
-			opts = append(opts, "device="+device)
-		}
-		if err := unix.Mount(devices[0], im.path, "erofs", unix.MS_RDONLY|unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, strings.Join(opts, ",")); err != nil {
-			return m, errors.Join(fmt.Errorf("mount EROFS: %w", err), m.Close())
-		}
-		im.mounted = true
-		*item.dest = filepath.Join(im.path, item.target)
-		if err := regularSize(*item.dest, item.image.Size); err != nil {
+		if err := m.mountView(ctx, s.store.Root, item.name, item.target, item.image, item.dest); err != nil {
 			return m, errors.Join(err, m.Close())
 		}
 	}
 	return m, nil
 }
 
-func attachLoop(path string) (*os.File, error) {
-	image, err := os.Open(path)
+func (s *Store) MountLower(ctx context.Context, lower *Lower, mountRoot string) (*Mounted, error) {
+	if lower == nil {
+		return nil, errors.New("missing lower")
+	}
+	verified, err := s.LoadLower(ctx, lower.ID)
 	if err != nil {
 		return nil, err
 	}
-	defer image.Close()
-	control, err := os.OpenFile("/dev/loop-control", os.O_RDWR, 0)
+	if descriptorDigest(verified) != descriptorDigest(lower) {
+		return nil, ErrSnapshotConflict
+	}
+	if err := os.MkdirAll(mountRoot, 0700); err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp(mountRoot, "lower-"+lower.ID+"-")
 	if err != nil {
 		return nil, err
 	}
-	defer control.Close()
-	for range 32 {
-		n, err := unix.IoctlRetInt(int(control.Fd()), unix.LOOP_CTL_GET_FREE)
-		if err != nil {
-			return nil, err
-		}
-		loop, err := os.OpenFile(fmt.Sprintf("/dev/loop%d", n), os.O_RDWR, 0)
-		if err != nil {
-			return nil, err
-		}
-		config := &unix.LoopConfig{Fd: uint32(image.Fd()), Info: unix.LoopInfo64{Flags: unix.LO_FLAGS_READ_ONLY | unix.LO_FLAGS_AUTOCLEAR}}
-		if err := unix.IoctlLoopConfigure(int(loop.Fd()), config); err != nil {
-			loop.Close()
-			if errors.Is(err, unix.EBUSY) {
-				continue
-			}
-			return nil, err
-		}
-		return loop, nil
+	m := &Mounted{dir: dir}
+	if err := m.mountView(ctx, s.Root, "lower", "lower/rootfs.ext4", verified.Image, &m.LowerPath); err != nil {
+		return m, errors.Join(err, m.Close())
 	}
-	return nil, errors.New("unable to reserve a loop device")
+	return m, nil
+}
+
+func (m *Mounted) mountView(ctx context.Context, storeRoot, name, target string, image Image, dest *string) error {
+	im := &imageMount{path: filepath.Join(m.dir, name)}
+	m.mounts = append(m.mounts, im)
+	if err := os.Mkdir(im.path, 0700); err != nil {
+		return err
+	}
+	var devices []string
+	for _, a := range append([]Artifact{image.Artifact}, image.Devices...) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		devices = append(devices, filepath.Join(storeRoot, a.File))
+	}
+	var opts []string
+	for _, device := range devices[1:] {
+		opts = append(opts, "device="+device)
+	}
+	data := strings.Join(opts, ",")
+	// mount(2) copies at most one page of options. File paths are longer
+	// than loop names; reject oversized chains before the kernel truncates them.
+	if len(data) >= os.Getpagesize() {
+		return errors.New("EROFS history mount options exceed the kernel page limit")
+	}
+	// Call mount(2) directly: mount(8) may silently allocate a loop device
+	// for a regular-file source on older util-linux versions.
+	if err := unix.Mount(devices[0], im.path, "erofs", unix.MS_RDONLY|unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, data); err != nil {
+		return fmt.Errorf("mount file-backed EROFS (requires CONFIG_EROFS_FS_BACKED_BY_FILE and a supported backing filesystem): %w", err)
+	}
+	im.mounted = true
+	*dest = filepath.Join(im.path, target)
+	return regularSize(*dest, image.Size)
 }
 
 func (m *Mounted) Close() error {
@@ -141,10 +148,6 @@ func (m *Mounted) Close() error {
 			}
 			im.mounted = false
 		}
-		for _, loop := range im.loops {
-			result = errors.Join(result, loop.Close())
-		}
-		im.loops = nil
 	}
 	if result == nil {
 		result = os.RemoveAll(m.dir)

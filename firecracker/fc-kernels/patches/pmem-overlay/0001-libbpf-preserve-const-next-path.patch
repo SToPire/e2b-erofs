@@ -1,0 +1,20 @@
+From: E2B kernel build <kernel-build@localhost>
+Subject: [PATCH] tools/libbpf: preserve const when splitting a search path
+
+New glibc headers expose a const-preserving strchr() when _GNU_SOURCE enables
+C23 interfaces, including when the compiler uses an older language dialect.
+next_path is only used for a pointer difference; it never modifies the string.
+Preserve the const qualification to build the 6.1 host tools with these headers.
+
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -10748,7 +10748,7 @@ static int resolve_full_path(const char *file, char *result, size_t result_sz)
+ 		if (!search_paths[i])
+ 			continue;
+ 		for (s = search_paths[i]; s != NULL; s = strchr(s, ':')) {
+-			char *next_path;
++			const char *next_path;
+ 			int seg_len;
+ 
+ 			if (s[0] == ':')

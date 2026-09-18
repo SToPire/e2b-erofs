@@ -13,9 +13,9 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 )
 
-// EROFSTemplate holds a committed local snapshot. Each sandbox acquires its own
-// mounts, so template-cache eviction cannot unmount RAM or a qcow2 backing file
-// that a running Firecracker still uses. Committed generations are retained.
+// EROFSTemplate holds a committed local snapshot. Each sandbox acquires a
+// reference to the Factory's shared mounts. Runtime references hold RAM and
+// qcow2 backing files through template-cache eviction. Generations are retained.
 type EROFSTemplate struct {
 	paths    storage.CachePaths
 	snapshot *erofs.Snapshot

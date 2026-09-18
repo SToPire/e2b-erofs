@@ -34,6 +34,13 @@ func (s *Sandbox) cleanupNativeInputs(ctx context.Context) error {
 		}
 	}
 	if s.Resources != nil {
+		if state != nil && state.v2Request != nil {
+			if provider, ok := s.rootfs.(*nativeRawRootfs); ok {
+				if err := provider.discardRetainedCapture(); err != nil {
+					return err
+				}
+			}
+		}
 		if provider, ok := s.rootfs.(*erofsRootfs); ok {
 			if err := provider.discard(); err != nil {
 				return fmt.Errorf("discard native disk inputs: %w", err)

@@ -360,6 +360,7 @@ type Sandbox struct {
 	nativeBaseline  bool
 	nativeDiskSize  int64
 	nativeResources *nativeResources
+	v2Runtime       *v2Runtime
 
 	*Resources
 	*Metadata
@@ -616,13 +617,14 @@ type Factory struct {
 	Sandboxes         *Map
 	config            cfg.BuilderConfig
 	networkPool       network.PoolInterface
-	devicePool        *nbd.DevicePool
+	legacyRootfs      *legacyRootfsResources
 	featureFlags      *featureflags.Client
 	hostStatsDelivery hoststats.Delivery
 	cgroupManager     cgroup.Manager
 	egressProxy       network.EgressProxy
 	networkAssignHook NetworkAssignHook
 	envdBinCache      *envdbin.Cache
+	sharedMounts      *erofs.SharedMounts
 
 	// swapEnvdBinary is the offline envd upgrade's one call into the host. Nil
 	// means rootfs.SwapEnvdBinary; a test substitutes it to drive the decision
@@ -658,6 +660,30 @@ func NewFactory(
 	networkAssignHook NetworkAssignHook,
 	sandboxes *Map,
 ) *Factory {
+	var legacy *legacyRootfsResources
+	if devicePool != nil && !config.EROFSNativeOnly {
+		legacy = &legacyRootfsResources{devices: devicePool}
+	}
+	return newFactory(ctx, config, networkPool, legacy, featureFlags, hostStatsDelivery, cgroupManager, egressProxy, networkAssignHook, sandboxes)
+}
+
+type legacyRootfsResources struct{ devices *nbd.DevicePool }
+
+// NewFileFactory has no NBD dependency. Legacy template/volume paths fail
+// explicitly instead of manufacturing a dummy device pool or falling back.
+func NewFileFactory(ctx context.Context, config cfg.BuilderConfig, networkPool network.PoolInterface,
+	flags *featureflags.Client, delivery hoststats.Delivery, manager cgroup.Manager,
+	proxy network.EgressProxy, hook NetworkAssignHook, sandboxes *Map) (*Factory, error) {
+	if config.EROFSSnapshotDir == "" || !config.EROFSNativeMemoryVerified || !config.EROFSPmemVerified {
+		return nil, errors.New("file-only Factory requires a persistent store and verified native-memory/pmem support")
+	}
+	config.EROFSNativeOnly = true
+	return newFactory(ctx, config, networkPool, nil, flags, delivery, manager, proxy, hook, sandboxes), nil
+}
+
+func newFactory(ctx context.Context, config cfg.BuilderConfig, networkPool network.PoolInterface,
+	legacy *legacyRootfsResources, featureFlags *featureflags.Client, hostStatsDelivery hoststats.Delivery,
+	cgroupManager cgroup.Manager, egressProxy network.EgressProxy, networkAssignHook NetworkAssignHook, sandboxes *Map) *Factory {
 	if networkAssignHook == nil {
 		networkAssignHook = NoopNetworkAssignHook{}
 	}
@@ -666,7 +692,7 @@ func NewFactory(
 		Sandboxes:         sandboxes,
 		config:            config,
 		networkPool:       networkPool,
-		devicePool:        devicePool,
+		legacyRootfs:      legacy,
 		featureFlags:      featureFlags,
 		hostStatsDelivery: hostStatsDelivery,
 		cgroupManager:     cgroupManager,
@@ -683,6 +709,7 @@ func NewFactory(
 		// paths silently off, with warms{} flat at zero, which is the one state the
 		// warm counter exists to make distinguishable from a working node.
 		envdBinCache: newEnvdBinCache(config.OrchestratorBaseDir),
+		sharedMounts: erofs.NewSharedMounts(config.EROFSSnapshotDir),
 	}
 
 	// Warm the promoted binary now rather than leaving it to the first resume that
@@ -719,6 +746,21 @@ func NewFactory(
 	}
 
 	return f
+}
+
+func (f *Factory) legacyDevices() (*nbd.DevicePool, error) {
+	if f.config.EROFSNativeOnly || f.legacyRootfs == nil {
+		return nil, errors.New("legacy rootfs backend is disabled; rebuild the template with the v2 file layout")
+	}
+	return f.legacyRootfs.devices, nil
+}
+
+// CloseSharedMounts follows sandbox and builder teardown in the node lifecycle.
+func (f *Factory) CloseSharedMounts(ctx context.Context) error {
+	if f.sharedMounts == nil {
+		return nil
+	}
+	return f.sharedMounts.Close(ctx)
 }
 
 // envdBinCacheDir is where the host envd binary's node-local copies live. It is
@@ -834,8 +876,12 @@ func (f *Factory) EgressProxy() network.EgressProxy {
 }
 
 // NewDirectPathMount opens host-side NBD access without a Firecracker VM.
-func (f *Factory) NewDirectPathMount(backend block.Device) *nbd.DirectPathMount {
-	return nbd.NewDirectPathMount(backend, f.devicePool, f.featureFlags)
+func (f *Factory) NewDirectPathMount(backend block.Device) (*nbd.DirectPathMount, error) {
+	pool, err := f.legacyDevices()
+	if err != nil {
+		return nil, err
+	}
+	return nbd.NewDirectPathMount(backend, pool, f.featureFlags), nil
 }
 
 // PreBootFn is an optional callback invoked after the rootfs is ready but before
@@ -847,6 +893,8 @@ type PreBootFn func(ctx context.Context, rootfsPath string) error
 type createOptions struct {
 	deferMarkRunning    bool
 	networkAssignReason NetworkAssignReason
+	pmemBootstrap       *PmemBootstrap
+	rawBootstrap        *RawBootstrap
 }
 
 type CreateOption func(*createOptions)
@@ -884,6 +932,9 @@ func (f *Factory) CreateSandbox(
 	createOpts := createOptions{networkAssignReason: NetworkAssignReasonCreate}
 	for _, opt := range opts {
 		opt(&createOpts)
+	}
+	if f.config.EROFSNativeOnly && !config.FirecrackerConfig.NativeMemory {
+		return nil, errors.New("file-only Factory requires native File memory for cold builds")
 	}
 
 	execCtx, execSpan := startExecutionSpan(ctx)
@@ -924,26 +975,76 @@ func (f *Factory) CreateSandbox(
 	}
 
 	var rootfsProvider rootfs.Provider
+	var v2 *v2Runtime
+	var runtimeSources fc.RuntimeSources
 	var nativeDiskSize int64
 	var err error
-	if source, ok := template.EROFS(t); ok {
+	if raw := createOpts.rawBootstrap; raw != nil {
+		if native == nil || runtime.SandboxType != SandboxTypeBuild || createOpts.pmemBootstrap != nil {
+			return nil, errors.New("raw bootstrap requires a native cold build and cannot be combined with pmem bootstrap")
+		}
+		upper, err := newV2RawRootfs(ctx, raw.Path, raw.SHA256, raw.Size, f.config.EROFSSnapshotDir)
+		if err != nil {
+			return nil, err
+		}
+		native.closeDisk = upper.Close
+		v2, err = f.rawBuildRuntime(ctx, config.FirecrackerConfig, upper)
+		if err != nil {
+			return nil, err
+		}
+		rootfsProvider, nativeDiskSize, runtimeSources.RawDisk = upper, raw.Size, true
+	} else if bootstrap := createOpts.pmemBootstrap; bootstrap != nil {
+		if native == nil || bootstrap.Boot.Layout != erofs.LayoutPmem {
+			return nil, errors.New("pmem bootstrap requires native memory and a pmem boot layout")
+		}
+		v2, runtimeSources, err = f.prepareV2Files(ctx, bootstrap.Boot, bootstrap.Lower,
+			bootstrap.UpperPath, bootstrap.UpperContentSHA256, bootstrap.UpperSize, native, config.FirecrackerConfig, runtime.TeamID)
+		if err != nil {
+			return nil, err
+		}
+		rootfsProvider, nativeDiskSize = v2.upper, bootstrap.UpperSize
+		if bootstrap.Export != nil {
+			if !config.SkipEnvdWait || runtime.SandboxType != SandboxTypeBuild {
+				return nil, errors.New("rootfs export is restricted to a build helper without envd")
+			}
+			export := *bootstrap.Export
+			runtimeSources.Rootfs.Export = &export
+			v2.exportHelper = true
+		}
+	} else if source, ok := template.EROFS(t); ok {
+		if f.config.EROFSNativeOnly && source.Manifest.Format != erofs.FormatV2 {
+			return nil, errors.New("file-only Factory cannot boot legacy EROFS snapshots; rebuild the template")
+		}
 		if !config.FirecrackerConfig.NativeMemory {
 			return nil, errors.New("EROFS cold boot requires native memory configuration")
 		}
-		mounted, mountErr := source.Mount(ctx, f.config.EROFSSnapshotDir)
+		mounted, mountErr := f.sharedMounts.Acquire(ctx, source, runtime.TeamID)
 		if mounted != nil {
-			native.closeMount = mounted.Close
+			native.closeMount = mounted.Release
 		}
 		if mountErr != nil {
 			return nil, mountErr
 		}
-		nativeDiskSize = source.Manifest.Disk.Size
-		provider, providerErr := newEROFSRootfs(ctx, f.devicePool, mounted.DiskPath, nativeDiskSize, f.config.EROFSSnapshotDir, source.Manifest.ID)
-		if provider != nil {
-			native.closeDisk = provider.Close
-			discardStartup = provider.discard
+		nativeDiskSize = source.Manifest.WritableDisk().Size
+		if source.Manifest.Format == erofs.FormatV2 {
+			v2, runtimeSources, err = f.prepareV2Runtime(ctx, source, mounted, native, config.FirecrackerConfig, runtime.TeamID)
+			if err != nil {
+				return nil, err
+			}
+			runtimeSources.MemoryPath = "" // Cold boot rebuilds ordinary RAM.
+			rootfsProvider = v2.upper
+		} else {
+			pool, poolErr := f.legacyDevices()
+			if poolErr != nil {
+				return nil, poolErr
+			}
+			provider, providerErr := newEROFSRootfs(ctx, pool, mounted.DiskPath(), nativeDiskSize, f.config.EROFSSnapshotDir, source.Manifest.ID)
+			if provider != nil {
+				native.closeDisk = provider.Close
+				discardStartup = provider.discard
+			}
+			rootfsProvider, err = provider, providerErr
 		}
-		rootfsProvider, err = provider, providerErr
 	} else {
 		rootFS, rootErr := t.Rootfs()
 		if rootErr != nil {
@@ -956,13 +1057,29 @@ func (f *Factory) CreateSandbox(
 		if native != nil {
 			rootfsProvider, err = newNativeRawRootfs(ctx, rootFS, rootfsCachePath, f.config.EROFSSnapshotDir)
 		} else if rootfsCachePath == "" {
-			rootfsProvider, err = rootfs.NewNBDProvider(ctx, rootFS, sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig), f.devicePool, f.featureFlags)
+			pool, poolErr := f.legacyDevices()
+			if poolErr != nil {
+				return nil, poolErr
+			}
+			rootfsProvider, err = rootfs.NewNBDProvider(ctx, rootFS, sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig), pool, f.featureFlags)
 		} else {
 			rootfsProvider, err = rootfs.NewDirectProvider(ctx, rootFS, rootfsCachePath)
 		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rootfs overlay: %w", err)
+	}
+	if f.config.EROFSNativeOnly && v2 == nil {
+		native.closeDisk = rootfsProvider.Close
+		upper, ok := rootfsProvider.(*nativeRawRootfs)
+		if !ok {
+			return nil, errors.New("file-only builds require a raw rootfs provider")
+		}
+		v2, err = f.rawBuildRuntime(ctx, config.FirecrackerConfig, upper)
+		if err != nil {
+			return nil, err
+		}
+		runtimeSources.RawDisk = true
 	}
 	if native != nil {
 		native.closeDisk = rootfsProvider.Close
@@ -1020,6 +1137,7 @@ func (f *Factory) CreateSandbox(
 		return cgroupHandle.Remove(ctx)
 	})
 
+	runtimeSources.LifecycleID = lifecycleID
 	fcHandle, err := fc.NewProcess(
 		ctx,
 		execCtx,
@@ -1029,6 +1147,7 @@ func (f *Factory) CreateSandbox(
 		config.FirecrackerConfig,
 		rootfsProvider,
 		fc.ConstantRootfsPaths,
+		runtimeSources,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init FC: %w", err)
@@ -1068,6 +1187,7 @@ func (f *Factory) CreateSandbox(
 		nativeBaseline:     config.FirecrackerConfig.NativeMemory,
 		nativeResources:    native,
 		nativeDiskSize:     nativeDiskSize,
+		v2Runtime:          v2,
 		LifecycleID:        lifecycleID,
 		LifecycleStartedAt: time.Now().UTC(),
 
@@ -1166,6 +1286,14 @@ func (f *Factory) CreateSandbox(
 	}()
 
 	if !createOpts.deferMarkRunning {
+		if sbx.usesPmemRootfs() && !config.SkipEnvdWait {
+			if err := sbx.WaitForEnvd(ctx, StartTypeCreate, f.GetEnvdTimeout(ctx)); err != nil {
+				return nil, err
+			}
+			if err := sbx.CommitPmemResume(ctx); err != nil {
+				return nil, err
+			}
+		}
 		f.Sandboxes.MarkRunning(ctx, sbx)
 	}
 
@@ -1307,6 +1435,9 @@ func (f *Factory) ResumeSandbox(
 	}()
 
 	erofsSnapshot, nativeMemory := template.EROFS(t)
+	if f.config.EROFSNativeOnly && (!nativeMemory || erofsSnapshot.Manifest.Format != erofs.FormatV2) {
+		return nil, errors.New("file-only Factory requires a v2 snapshot; rebuild the template")
+	}
 	if nativeMemory {
 		if f.config.EROFSSnapshotDir == "" || !f.config.EROFSNativeMemoryVerified {
 			return nil, errors.New("EROFS restore requires a configured local store and verified native Firecracker memory support")
@@ -1327,12 +1458,12 @@ func (f *Factory) ResumeSandbox(
 
 	telemetry.ReportEvent(ctx, "created sandbox files")
 
-	var mounted *erofs.Mounted
+	var mounted *erofs.MountRef
 	if nativeMemory {
 		var mountErr error
-		mounted, mountErr = erofsSnapshot.Mount(ctx, f.config.EROFSSnapshotDir)
+		mounted, mountErr = f.sharedMounts.Acquire(ctx, erofsSnapshot, runtime.TeamID)
 		if mounted != nil {
-			native.closeMount = mounted.Close
+			native.closeMount = mounted.Release
 		}
 		if mountErr != nil {
 			return nil, fmt.Errorf("mount EROFS snapshot: %w", mountErr)
@@ -1340,15 +1471,29 @@ func (f *Factory) ResumeSandbox(
 	}
 
 	var nativeOverlay *erofsRootfs
+	var v2 *v2Runtime
+	var runtimeSources fc.RuntimeSources
 	if nativeMemory {
-		var overlayErr error
-		nativeOverlay, overlayErr = newEROFSRootfs(ctx, f.devicePool, mounted.DiskPath, erofsSnapshot.Manifest.Disk.Size, f.config.EROFSSnapshotDir, erofsSnapshot.Manifest.ID)
-		if nativeOverlay != nil {
-			native.closeDisk = nativeOverlay.Close
-			discardStartup = nativeOverlay.discard
-		}
-		if overlayErr != nil {
-			return nil, overlayErr
+		if erofsSnapshot.Manifest.Format == erofs.FormatV2 {
+			var err error
+			v2, runtimeSources, err = f.prepareV2Runtime(ctx, erofsSnapshot, mounted, native, config.FirecrackerConfig, runtime.TeamID)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			var overlayErr error
+			pool, poolErr := f.legacyDevices()
+			if poolErr != nil {
+				return nil, poolErr
+			}
+			nativeOverlay, overlayErr = newEROFSRootfs(ctx, pool, mounted.DiskPath(), erofsSnapshot.Manifest.Disk.Size, f.config.EROFSSnapshotDir, erofsSnapshot.Manifest.ID)
+			if nativeOverlay != nil {
+				native.closeDisk = nativeOverlay.Close
+				discardStartup = nativeOverlay.discard
+			}
+			if overlayErr != nil {
+				return nil, overlayErr
+			}
 		}
 	}
 
@@ -1494,6 +1639,9 @@ func (f *Factory) ResumeSandbox(
 	// Rootfs initialization
 	overlayPromise := utils.NewPromise(func() (rootfs.Provider, error) {
 		if nativeMemory {
+			if v2 != nil {
+				return v2.upper, nil
+			}
 			return nativeOverlay, nil
 		}
 		readonlyRootfs, err := t.Rootfs()
@@ -1503,11 +1651,15 @@ func (f *Factory) ResumeSandbox(
 
 		telemetry.ReportEvent(ctx, "got template rootfs")
 
+		pool, poolErr := f.legacyDevices()
+		if poolErr != nil {
+			return nil, poolErr
+		}
 		overlay, err := rootfs.NewNBDProvider(
 			ctx,
 			readonlyRootfs,
 			sandboxFiles.SandboxCacheRootfsPath(f.config.StorageConfig),
-			f.devicePool,
+			pool,
 			f.featureFlags,
 		)
 		if err != nil {
@@ -1645,6 +1797,11 @@ func (f *Factory) ResumeSandbox(
 		return cgroupHandle.Remove(ctx)
 	})
 
+	memorySource := runtimeSources
+	memorySource.LifecycleID = lifecycleID
+	if mounted != nil {
+		memorySource.MemoryPath = mounted.MemoryPath()
+	}
 	fcHandle, fcErr := fc.NewProcess(
 		ctx,
 		execCtx,
@@ -1659,6 +1816,7 @@ func (f *Factory) ResumeSandbox(
 			TemplateID:      config.BaseTemplateID,
 			BuildID:         rootfsBuildID,
 		},
+		memorySource,
 	)
 	if fcErr != nil {
 		return nil, fmt.Errorf("failed to create FC: %w", fcErr)
@@ -1709,6 +1867,7 @@ func (f *Factory) ResumeSandbox(
 
 	sbx := &Sandbox{
 		nativeResources:    native,
+		v2Runtime:          v2,
 		LifecycleID:        lifecycleID,
 		LifecycleStartedAt: time.Now().UTC(),
 
@@ -1814,7 +1973,7 @@ func (f *Factory) ResumeSandbox(
 	if nativeMemory {
 		fcStartErr = fcHandle.ResumeFile(ctx, sbxlogger.SandboxMetadata{
 			SandboxID: runtime.SandboxID, TemplateID: runtime.TemplateID, TeamID: runtime.TeamID,
-		}, mounted.MemoryPath, snapfile, config.Envd.AccessToken, cgroupFD,
+		}, mounted.MemoryPath(), snapfile, config.Envd.AccessToken, cgroupFD,
 			fc.RateLimiterConfig{Ops: fc.TokenBucketConfig(resumeThrottleConfig.Ops), Bandwidth: fc.TokenBucketConfig(resumeThrottleConfig.Bandwidth)},
 			fc.RateLimiterConfig{Ops: fc.TokenBucketConfig(resumeDriveThrottleConfig.Ops), Bandwidth: fc.TokenBucketConfig(resumeDriveThrottleConfig.Bandwidth)})
 	} else {
@@ -1879,6 +2038,11 @@ func (f *Factory) ResumeSandbox(
 	// live sandbox: keep it out of the live registry so it is not addressable and
 	// does not inflate the node's reported allocation or emit per-sandbox metrics,
 	// and skip health checks it would never need.
+	if !ropts.deferMarkRunning {
+		if err := sbx.CommitPmemResume(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if !ropts.skipLiveRegistration && !ropts.deferMarkRunning {
 		f.Sandboxes.MarkRunning(ctx, sbx)
 	}

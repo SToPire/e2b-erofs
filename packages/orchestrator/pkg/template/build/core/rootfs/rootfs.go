@@ -166,7 +166,8 @@ func (r *Rootfs) CreateExt4Filesystem(
 	l.Info(ctx, "Creating file system and pulling Docker image")
 	maxRootfsSize := units.MBToBytes(int64(r.featureFlags.IntFlag(ctx, featureflags.BuildBaseRootfsSizeLimitMB)))
 	mkfsOpts := filesystem.MakeOptions{
-		DirIndex: r.featureFlags.BoolFlag(ctx, featureflags.BuildExt4DirIndex),
+		DirIndex:     r.featureFlags.BoolFlag(ctx, featureflags.BuildExt4DirIndex),
+		NoInlineData: r.buildContext.BuilderConfig.EROFSNativeOnly,
 	}
 	ext4Size, err := oci.ToExt4(ctx, l, img, rootfsPath, maxRootfsSize, template.RootfsBlockSize(), mkfsOpts)
 	if err != nil {

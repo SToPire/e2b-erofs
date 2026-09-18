@@ -784,16 +784,15 @@ func run(config cfg.Config, opts Options) (success bool) {
 	}
 
 	// device pool
-	devicePool, err := nbd.NewDevicePool(config.NBDPoolSize)
-	if err != nil {
-		logger.L().Fatal(ctx, "failed to create device pool", zap.Error(err))
+	var devicePool *nbd.DevicePool
+	if !config.EROFSNativeOnly {
+		devicePool, err = nbd.NewDevicePool(config.NBDPoolSize)
+		if err != nil {
+			logger.L().Fatal(ctx, "failed to create device pool", zap.Error(err))
+		}
+		startService("nbd device pool", func() error { devicePool.Populate(ctx); return nil })
+		closers = append(closers, closer{"device pool", devicePool.Close})
 	}
-	startService("nbd device pool", func() error {
-		devicePool.Populate(ctx)
-
-		return nil
-	})
-	closers = append(closers, closer{"device pool", devicePool.Close})
 
 	// network pool
 	slotStorage, err := network.NewStorageLocal(ctx, config.NetworkConfig, egressSetup.Proxy)
@@ -876,7 +875,16 @@ func run(config cfg.Config, opts Options) (success bool) {
 	if networkAssignHook == nil {
 		networkAssignHook = sandbox.NoopNetworkAssignHook{}
 	}
-	sandboxFactory := sandbox.NewFactory(ctx, config.BuilderConfig, networkPool, devicePool, featureFlags, hostStatsDelivery, cgroupManager, egressSetup.Proxy, networkAssignHook, sandboxes)
+	var sandboxFactory *sandbox.Factory
+	if config.EROFSNativeOnly {
+		sandboxFactory, err = sandbox.NewFileFactory(ctx, config.BuilderConfig, networkPool, featureFlags, hostStatsDelivery, cgroupManager, egressSetup.Proxy, networkAssignHook, sandboxes)
+		if err != nil {
+			logger.L().Fatal(ctx, "failed to create file-only sandbox factory", zap.Error(err))
+		}
+	} else {
+		sandboxFactory = sandbox.NewFactory(ctx, config.BuilderConfig, networkPool, devicePool, featureFlags, hostStatsDelivery, cgroupManager, egressSetup.Proxy, networkAssignHook, sandboxes)
+	}
+	closers = append(closers, closer{"shared EROFS mounts", sandboxFactory.CloseSharedMounts})
 
 	// confined volume filesystems (for the volume service and nfs proxy)
 	if err := chrooted.CheckSupport(); err != nil {

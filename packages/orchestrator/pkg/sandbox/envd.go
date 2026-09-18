@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/envd"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/logger"
@@ -79,6 +80,7 @@ func (s *Sandbox) doRequestWithInfiniteRetries(
 	ctx context.Context,
 	method,
 	address string,
+	phases ...envd.PostInitJSONBodyResumePhase,
 ) (*http.Response, int64, error) {
 	requestCount := int64(0)
 
@@ -91,6 +93,12 @@ func (s *Sandbox) doRequestWithInfiniteRetries(
 		DefaultWorkdir: utils.DerefOrDefault(s.Config.Envd.DefaultWorkdir, ""),
 		VolumeMounts:   s.convertMounts(s.Config.VolumeMounts),
 		CaBundle:       s.CABundle,
+	}
+	if s.usesPmemRootfs() {
+		jsonBody.ResumePhase = envd.Prepare
+	}
+	if len(phases) != 0 {
+		jsonBody.ResumePhase = phases[0]
 	}
 
 	for {
@@ -593,6 +601,9 @@ func (s *Sandbox) initEnvd(ctx context.Context, startType StartType, recordMetri
 		)
 
 		return fmt.Errorf("unexpected status code: %d", response.StatusCode)
+	}
+	if s.usesPmemRootfs() && (response.Header.Get("X-Envd-Rootfs-Layout") != fc.PmemRootfsLayout || response.Header.Get("X-Envd-Resume-Phase") != "prepare") {
+		return errors.New("envd does not acknowledge the pmem prepare protocol")
 	}
 
 	s.log().Debug(ctx, "succeeded to init envd",

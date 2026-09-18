@@ -102,11 +102,10 @@ func (o *Orchestrator) CreateSnapshotTemplate(ctx context.Context, teamID uuid.U
 		Metadata:  map[string]string{storageopts.ObjectMetadataTemplateID: snapshotTemplateEnvID},
 	})
 	if intent != nil {
-		if receiptErr := o.observeCheckpointResult(ctx, intent, err); receiptErr != nil {
-			err = errors.Join(err, receiptErr)
-		}
-		finish(errCheckpointPending)
-		if err := o.finishNativeCheckpoint(ctx, *intent, err); err != nil {
+		// The worker owns transition release; the deferred callback cannot block
+		// the HTTP response if Redis is unavailable after caller cancellation.
+		once.Do(func() {})
+		if err := o.finishNativeCheckpoint(ctx, *intent, err, finishSnapshotting); err != nil {
 			return SnapshotTemplateResult{}, err
 		}
 		telemetry.ReportEvent(ctx, "Snapshot template completed")

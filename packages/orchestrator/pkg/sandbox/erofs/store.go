@@ -68,14 +68,19 @@ type Image struct {
 }
 
 type Manifest struct {
-	Format   string    `json:"format"`
-	ID       string    `json:"id"`
-	ParentID string    `json:"parent_id,omitempty"`
-	Memory   Image     `json:"memory"`
-	Disk     Image     `json:"disk"`
-	VMState  Artifact  `json:"vmstate"`
-	Metadata *Artifact `json:"metadata,omitempty"`
-	Capture  *Artifact `json:"capture,omitempty"`
+	Format             string      `json:"format"`
+	ID                 string      `json:"id"`
+	ParentID           string      `json:"parent_id,omitempty"`
+	Memory             Image       `json:"memory"`
+	Disk               Image       `json:"disk,omitzero"`
+	Upper              *Image      `json:"upper,omitempty"`
+	UpperContentSHA256 string      `json:"upper_content_sha256,omitempty"`
+	Lower              *Lower      `json:"lower,omitempty"`
+	Boot               *BootLayout `json:"boot,omitempty"`
+	MemoryCapture      string      `json:"memory_capture,omitempty"`
+	VMState            Artifact    `json:"vmstate"`
+	Metadata           *Artifact   `json:"metadata,omitempty"`
+	Capture            *Artifact   `json:"capture,omitempty"`
 }
 
 type Store struct {
@@ -370,6 +375,7 @@ func (s *Store) verifyCommitted(ctx context.Context, id string, syncDir func(str
 }
 
 func (s *Store) load(ctx context.Context, id string, seen map[string]bool) (*Snapshot, error) {
+	ctx = withVerification(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -378,7 +384,7 @@ func (s *Store) load(ctx context.Context, id string, seen map[string]bool) (*Sna
 	}
 	seen[id] = true
 	dir := filepath.Join(s.Root, id)
-	data, err := os.ReadFile(filepath.Join(dir, ManifestName))
+	data, err := trackedMetadata(ctx, filepath.Join(dir, ManifestName))
 	if err != nil {
 		return nil, err
 	}
@@ -388,6 +394,12 @@ func (s *Store) load(ctx context.Context, id string, seen map[string]bool) (*Sna
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if m.Format == FormatV2 {
+		return s.loadV2(ctx, dir, id, m, seen)
+	}
+	if m.Upper != nil || m.Lower != nil || m.Boot != nil || m.MemoryCapture != "" || m.UpperContentSHA256 != "" {
+		return nil, errors.New("legacy snapshot contains v2 layout fields")
 	}
 	if m.Format != Format || m.ID != id || m.Memory.Size <= 0 || m.Memory.Size%BlockSize != 0 || m.Disk.Size <= 0 || m.Disk.Size%BlockSize != 0 {
 		return nil, errors.New("invalid EROFS snapshot manifest")
@@ -416,17 +428,11 @@ func (s *Store) load(ctx context.Context, id string, seen map[string]bool) (*Sna
 		artifacts = append(artifacts, *m.Capture)
 	}
 	for _, a := range artifacts {
-		actual, err := describeContext(ctx, filepath.Join(s.Root, a.File), a.File)
-		if err != nil {
+		if err := s.verifyArtifact(ctx, a); err != nil {
 			return nil, err
 		}
-		if actual != a || a.Bytes <= 0 {
-			return nil, fmt.Errorf("snapshot artifact validation failed: %s", a.File)
-		}
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+
 	return &Snapshot{Dir: dir, Manifest: m, store: s}, nil
 }
 

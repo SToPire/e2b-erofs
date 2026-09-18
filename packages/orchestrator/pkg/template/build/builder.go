@@ -531,7 +531,7 @@ func runBuild(
 		if !ok {
 			return nil, errors.New("EROFS build produced a legacy template")
 		}
-		rootfsSize = uint64(snapshot.Manifest.Disk.Size)
+		rootfsSize = uint64(snapshot.Manifest.WritableDisk().Size)
 	} else {
 		rootfsSize, err = getRootfsSize(ctx, builder.templateStorage, storage.Paths{BuildID: lastLayerResult.Metadata.Template.BuildID})
 	}

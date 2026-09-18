@@ -204,12 +204,13 @@ func (c *apiClient) setMetrics(ctx context.Context, metricsPath string) error {
 	return nil
 }
 
-func (c *apiClient) setBootSource(ctx context.Context, kernelArgs string, kernelPath string) error {
+func (c *apiClient) setBootSource(ctx context.Context, kernelArgs string, kernelPath string, initramfsPath string) error {
 	bootSourceConfig := operations.PutGuestBootSourceParams{
 		Context: ctx,
 		Body: &models.BootSource{
 			BootArgs:        kernelArgs,
 			KernelImagePath: &kernelPath,
+			InitrdPath:      initramfsPath,
 		},
 	}
 
@@ -218,7 +219,7 @@ func (c *apiClient) setBootSource(ctx context.Context, kernelArgs string, kernel
 	return err
 }
 
-func (c *apiClient) setRootfsDrive(ctx context.Context, rootfsPath string, ioEngine *string, rateLimiter *models.RateLimiter) error {
+func (c *apiClient) setRootfsDrive(ctx context.Context, rootfsPath string, ioEngine *string, rateLimiter *models.RateLimiter, rawBuild bool) error {
 	driveID := rootfsDriveID
 
 	isRootDevice := true
@@ -233,6 +234,11 @@ func (c *apiClient) setRootfsDrive(ctx context.Context, rootfsPath string, ioEng
 			IoEngine:     ioEngine,
 			RateLimiter:  rateLimiter,
 		},
+	}
+	if rawBuild {
+		cache, engine := models.DriveCacheTypeWriteback, "Sync"
+		driversConfig.Body.CacheType = &cache
+		driversConfig.Body.IoEngine = &engine
 	}
 
 	_, err := c.client.Operations.PutGuestDriveByID(&driversConfig)

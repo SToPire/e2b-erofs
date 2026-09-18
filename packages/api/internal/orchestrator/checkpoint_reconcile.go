@@ -125,7 +125,7 @@ func (o *Orchestrator) rememberCheckpointCommit(ctx context.Context, i *checkpoi
 	if err != nil {
 		return err
 	}
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	return o.checkpointRedis.HSet(writeCtx, checkpointIntentsKey, i.BuildID.String(), data).Err()
 }
@@ -257,13 +257,40 @@ func (o *Orchestrator) removeCheckpointRuntime(ctx context.Context, i checkpoint
 	return o.RemoveSandbox(ctx, i.TeamID, i.SandboxID, sandbox.RemoveOpts{Action: sandbox.StateActionKill, ExpectExecutionID: i.ExecutionID, ExpectCheckpointBuildID: i.BuildID.String()})
 }
 
-func (o *Orchestrator) finishNativeCheckpoint(ctx context.Context, i checkpointIntent, actionErr error) error {
-	waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+func (o *Orchestrator) finishNativeCheckpoint(ctx context.Context, i checkpointIntent, actionErr error, release func(context.Context, error)) error {
+	// Foreground reconciliation must finish inside the HTTP request budget.
+	// Receipt persistence, transition release and reconciliation run in that
+	// order in one worker. Redis socket timeouts can outlive caller cancellation;
+	// the buffered result never holds the worker or HTTP response after timeout.
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		workerErr := actionErr
+		if receiptErr := o.observeCheckpointResult(waitCtx, &i, actionErr); receiptErr != nil {
+			workerErr = errors.Join(workerErr, receiptErr)
+		}
+		releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		release(releaseCtx, errCheckpointPending)
+		releaseCancel()
+		done <- o.waitNativeCheckpoint(waitCtx, i, workerErr)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-waitCtx.Done():
+		return errors.Join(errCheckpointPending, actionErr, waitCtx.Err())
+	}
+}
+
+func (o *Orchestrator) waitNativeCheckpoint(waitCtx context.Context, i checkpointIntent, actionErr error) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	var lastErr error
 	for {
+		if err := waitCtx.Err(); err != nil {
+			return errors.Join(errCheckpointPending, actionErr, lastErr, err)
+		}
 		result, err := o.reconcileCheckpoint(waitCtx, i)
 		if result.runtimeApplied {
 			i.RuntimeReceipt = orchestrator.CheckpointRuntimeState_CHECKPOINT_RUNTIME_UNKNOWN

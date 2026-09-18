@@ -24,6 +24,7 @@ type nativeCapture struct {
 	store            *erofs.Store
 	capture          *erofs.Capture
 	request          erofs.BuildRequest
+	v2Request        *erofs.BuildV2Request
 	sealed           bool
 	memoryCaptured   bool
 	memoryAttempts   int
@@ -50,6 +51,9 @@ func (e *NativeCaptureFailure) Unwrap() error { return e.Cause }
 func (s *Sandbox) UsesEROFS() bool { return s.Config.FirecrackerConfig.NativeMemory }
 
 func (s *Sandbox) pauseEROFS(ctx context.Context, meta metadata.Template) (_ *Snapshot, resultErr error) {
+	if s.v2Runtime != nil && s.v2Runtime.exportHelper {
+		return nil, errors.New("disposable rootfs export helpers cannot publish RAM snapshots")
+	}
 	s.nativeCaptureMu.Lock()
 	defer s.nativeCaptureMu.Unlock()
 	defer func() {
@@ -86,9 +90,32 @@ func (s *Sandbox) pauseEROFS(ctx context.Context, meta metadata.Template) (_ *Sn
 	diskSize := s.nativeDiskSize
 	if parent, ok := template.EROFS(s.Template); ok && !s.nativeBaseline {
 		parentID = parent.Manifest.ID
-		diskSize = parent.Manifest.Disk.Size
+		diskSize = parent.Manifest.WritableDisk().Size
 	}
-	meta = meta.MarkFilesystemOnly(false).MarkFsQuiesced(false)
+	if s.v2Runtime != nil && s.v2Runtime.upper.identity != nil {
+		diskSize = s.v2Runtime.upper.identity.Size()
+	}
+	frozen, err := s.freezePmemForCapture(ctx)
+	if err != nil {
+		_ = os.RemoveAll(capture.Dir)
+		return nil, err
+	}
+	rollback := true
+	checksStopped := false
+	defer func() {
+		if rollback && frozen {
+			rollbackErr := s.rollbackPmemFreeze(ctx)
+			resultErr = errors.Join(resultErr, rollbackErr)
+			if rollbackErr == nil && checksStopped {
+				s.Checks = NewChecks(s)
+				go s.Checks.Start(context.WithoutCancel(ctx))
+			}
+		}
+		if rollback {
+			resultErr = errors.Join(resultErr, os.RemoveAll(capture.Dir))
+		}
+	}()
+	meta = meta.MarkFilesystemOnly(false).MarkFsQuiesced(frozen)
 	meta.Prefetch = nil
 	metadataPath := filepath.Join(capture.Dir, "metadata.json")
 	if err := meta.ToFile(metadataPath); err != nil {
@@ -100,6 +127,13 @@ func (s *Sandbox) pauseEROFS(ctx context.Context, meta metadata.Template) (_ *Sn
 		VMStatePath: capture.VMStatePath, MetadataPath: metadataPath,
 		MemorySize: s.Config.RamMB * 1024 * 1024, DiskSize: diskSize,
 	}}
+	if s.v2Runtime != nil {
+		state.request.DiskPath = filepath.Join(capture.Dir, "upper.sealed.raw")
+		state.v2Request = &erofs.BuildV2Request{ID: buildID.String(), ParentID: parentID,
+			MemorySize: state.request.MemorySize, UpperSize: diskSize, Boot: s.v2Runtime.boot, Lower: s.v2Runtime.lower,
+			ParentUpperPath: s.v2Runtime.parentUpper, MemoryCapture: "full"}
+		state.syncV2Request()
+	}
 	pid, err := s.process.Pid()
 	if err != nil {
 		return nil, err
@@ -109,12 +143,20 @@ func (s *Sandbox) pauseEROFS(ctx context.Context, meta metadata.Template) (_ *Sn
 		return nil, fmt.Errorf("identify native capture producer: %w", err)
 	}
 	s.Checks.Stop()
+	checksStopped = true
 	if err := s.process.Pause(ctx); err != nil {
+		if frozen {
+			if resumeErr := s.process.ResumeInPlace(context.WithoutCancel(ctx)); resumeErr != nil {
+				rollback = false
+				return nil, errors.Join(err, resumeErr, s.process.Stop(context.WithoutCancel(ctx)))
+			}
+		}
 		return nil, err
 	}
 	// Once this request starts, the native dirty bitmap may be consumed even
 	// if transport cancellation hides its response. Never issue another Diff.
 	s.nativeCapture = state
+	rollback = false
 	return s.finishNativeCapture(ctx, buildID)
 }
 
@@ -124,6 +166,9 @@ func (s *Sandbox) pauseEROFS(ctx context.Context, meta metadata.Template) (_ *Sn
 func (s *Sandbox) finishNativeCapture(ctx context.Context, buildID uuid.UUID) (*Snapshot, error) {
 	state := s.nativeCapture
 	if state.sealed {
+		return s.publishNativeCapture(ctx, buildID)
+	}
+	if state.v2Request != nil && state.recoveryRecorded && s.v2Runtime.upper.isClosed() {
 		return s.publishNativeCapture(ctx, buildID)
 	}
 	capture := state.capture
@@ -152,6 +197,13 @@ func (s *Sandbox) finishNativeCapture(ctx context.Context, buildID uuid.UUID) (*
 				continue
 			}
 			state.memoryCaptured = true
+			if state.v2Request != nil {
+				state.v2Request.MemoryCapture = "full"
+				if kind == fc.NativeSnapshotDiff {
+					state.v2Request.MemoryCapture = "diff"
+				}
+				state.syncV2Request()
+			}
 			break
 		}
 		if !state.memoryCaptured {
@@ -159,7 +211,17 @@ func (s *Sandbox) finishNativeCapture(ctx context.Context, buildID uuid.UUID) (*
 		}
 	}
 	if !state.recoveryRecorded {
-		if provider, ok := s.rootfs.(*erofsRootfs); ok {
+		if state.v2Request != nil {
+			rawPath, err := s.rootfs.Path()
+			if err != nil {
+				return nil, err
+			}
+			if err := state.store.RecordV2Recovery(sealCtx, filepath.Join(capture.Dir, "recovery.json"), *state.v2Request, rawPath, state.request.DiskPath, state.firecracker); err != nil {
+				return nil, err
+			}
+			s.v2Runtime.upper.retainForCapture()
+			state.recoveryRecorded = true
+		} else if provider, ok := s.rootfs.(*erofsRootfs); ok {
 			overlay, err := provider.overlay.RecoveryInfo()
 			if err != nil {
 				return nil, err
@@ -194,7 +256,26 @@ func (s *Sandbox) sealNativeCapture(ctx context.Context) error {
 		return ctx.Err()
 	}
 	if !state.diskSealed {
-		if state.request.ParentID != "" {
+		if state.v2Request != nil {
+			provider := s.v2Runtime.upper
+			if provider.privateDir != "" {
+				path, err := provider.seal(ctx, state.request.DiskPath)
+				if err != nil {
+					return err
+				}
+				state.request.DiskPath = path
+			} else if !state.baselineCopied {
+				path, err := provider.Path()
+				if err != nil {
+					return err
+				}
+				if err := captureRawDisk(path, state.request.DiskPath, state.request.DiskSize); err != nil {
+					return err
+				}
+				state.baselineCopied = true
+			}
+			state.syncV2Request()
+		} else if state.request.ParentID != "" {
 			provider, ok := s.rootfs.(*erofsRootfs)
 			if !ok {
 				return errors.New("incremental EROFS disk requires a qcow2 runtime")
@@ -225,7 +306,14 @@ func (s *Sandbox) sealNativeCapture(ctx context.Context) error {
 		}
 		state.diskSealed = true
 	}
-	requestBytes, err := json.MarshalIndent(state.request, "", "  ")
+	var requestData any = state.request
+	if state.v2Request != nil {
+		requestData = struct {
+			Version int                   `json:"version"`
+			Request *erofs.BuildV2Request `json:"request"`
+		}{2, state.v2Request}
+	}
+	requestBytes, err := json.MarshalIndent(requestData, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -291,7 +379,17 @@ func (s *Sandbox) publishNativeCapture(ctx context.Context, id uuid.UUID) (*Snap
 		state.published = true
 		return nativeSnapshot(snapshot, id), nil
 	}
-	snapshot, err := state.store.Build(ctx, state.request)
+	var snapshot *erofs.Snapshot
+	var err error
+	if state.v2Request != nil {
+		if state.recoveryRecorded {
+			snapshot, err = state.store.Recover(ctx, filepath.Join(state.capture.Dir, "recovery.json"))
+		} else {
+			snapshot, err = state.store.PublishV2Request(ctx, *state.v2Request)
+		}
+	} else {
+		snapshot, err = state.store.Build(ctx, state.request)
+	}
 	if snapshot != nil {
 		state.committed = snapshot
 	}
@@ -299,7 +397,21 @@ func (s *Sandbox) publishNativeCapture(ctx context.Context, id uuid.UUID) (*Snap
 		return nil, fmt.Errorf("publish EROFS snapshot; retry retained request %s: %w", filepath.Join(state.capture.Dir, "build-request.json"), err)
 	}
 	state.published = true
+	if state.v2Request != nil {
+		state.sealed = true
+		state.diskSealed = true
+	}
 	return nativeSnapshot(snapshot, id), nil
+}
+
+func (s *nativeCapture) syncV2Request() {
+	if s.v2Request == nil {
+		return
+	}
+	s.v2Request.MemoryPath = s.request.MemoryPath
+	s.v2Request.VMStatePath = s.request.VMStatePath
+	s.v2Request.MetadataPath = s.request.MetadataPath
+	s.v2Request.UpperPath = s.request.DiskPath
 }
 
 func nativeSnapshot(snapshot *erofs.Snapshot, id uuid.UUID) *Snapshot {

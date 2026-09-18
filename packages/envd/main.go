@@ -26,6 +26,7 @@ import (
 	publicport "github.com/e2b-dev/infra/packages/envd/internal/port"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/cgroups"
 	filesystemRpc "github.com/e2b-dev/infra/packages/envd/internal/services/filesystem"
+	"github.com/e2b-dev/infra/packages/envd/internal/services/pmemstate"
 	processRpc "github.com/e2b-dev/infra/packages/envd/internal/services/process"
 	"github.com/e2b-dev/infra/packages/envd/internal/utils"
 	"github.com/e2b-dev/infra/packages/envd/pkg"
@@ -223,6 +224,14 @@ func run() error {
 	// HTTP API (/freeze, /unfreeze, /init thaw) so every freeze/unfreeze caller
 	// serializes on a single lock.
 	workloadFreezer := cgroups.NewWorkloadFreezer(cgroupManager)
+	pmemController, err := pmemstate.Open()
+	if err != nil {
+		return fmt.Errorf("open pmem rootfs control state: %w", err)
+	}
+	if pmemController != nil {
+		defer pmemController.Close()
+		workloadFreezer.SetThawGuard(pmemController.CanThaw)
+	}
 	// Backstop for a freeze that never gets its thaw -- an orchestrator that resumes and
 	// never calls /init, or a thaw that fails outright. Without it such a guest stays
 	// frozen for the rest of its life.
@@ -275,6 +284,7 @@ func run() error {
 	}
 
 	service := api.New(&envLogger, defaults, mmdsChan, isNotFC, workloadFreezer, logFlusher)
+	service.SetPmemController(pmemController)
 	if resumeHandover {
 		// Restore the NFS mount ledger carried across the upgrade before the
 		// post-upgrade /init runs setupNFS, so it recognizes a still-live mount
@@ -296,7 +306,7 @@ func run() error {
 		// this path, so the fallback can't reopen the unauthenticated-upgrade
 		// window.
 		time.AfterFunc(handoverFallbackThawTimeout, func() {
-			if !service.Initialized() {
+			if pmemController == nil && !service.Initialized() {
 				fmt.Fprintf(os.Stderr, "envd: post-upgrade /init did not arrive within %s; thawing workload as fallback\n", handoverFallbackThawTimeout)
 				processService.UnfreezeWorkload()
 			}
@@ -344,6 +354,10 @@ func run() error {
 	// no CLOEXEC race to quiesce — and leaving it up means a failed upgrade never
 	// disturbs port forwarding.
 	doUpgrade := func(newBin string) error {
+		releasePmem, holdErr := service.HoldPmemUpgrade(ctx)
+		if holdErr != nil {
+			return holdErr
+		}
 		fmt.Fprintf(os.Stderr, "envd: self-upgrade (from v%s, newBin=%q)\n", pkg.Version, newBin)
 		// Hold the freeze lock across the WHOLE handover (freeze -> serialize ->
 		// execve), not just the freeze sweep, so a concurrent /init or /unfreeze
@@ -358,6 +372,7 @@ func run() error {
 		// replaces this process, so this defer never runs on success.
 		defer func() {
 			releaseFreeze()
+			releasePmem()
 			processService.UnfreezeWorkload() //nolint:contextcheck // (un)freeze uses a non-cancellable context internally so the thaw always lands
 		}()
 		if freezeErr != nil {
@@ -405,7 +420,7 @@ func run() error {
 		// guest process could drive an unauthenticated upgrade in that window
 		// (and after the fallback thaw). The orchestrator only triggers /upgrade
 		// on an already-initialized envd, so this never blocks the real caller.
-		if !service.Initialized() {
+		if !service.Authenticated() {
 			http.Error(w, "envd not initialized", http.StatusConflict)
 
 			return
@@ -449,7 +464,7 @@ func run() error {
 		}
 	})
 
-	err := s.ListenAndServe()
+	err = s.ListenAndServe()
 	// Signal goroutines to stop before deferred cleanup closes their resources.
 	// TODO: shutdown synchronization needs to be revisited.
 	cancel()

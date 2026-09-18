@@ -21,7 +21,21 @@ import (
 	"time"
 
 	"github.com/Merovius/nbd/nbdnl"
+	"github.com/mdlayher/netlink"
 )
+
+// nbdAttrBackendIdentifier is NBD_ATTR_BACKEND_IDENTIFIER from Linux UAPI:
+// https://raw.githubusercontent.com/torvalds/linux/v7.0/include/uapi/linux/nbd-netlink.h
+// The pinned nbdnl version does not provide this attribute or an option for it.
+const nbdAttrBackendIdentifier uint16 = 10
+
+// withBackendIdentifier binds the qcow2 path to the kernel NBD connection in
+// CONNECT itself. Linux exposes it in /sys/class/block/nbdX/backend until disconnect.
+func withBackendIdentifier(path string) nbdnl.ConnectOption {
+	return func(e *netlink.AttributeEncoder) {
+		e.String(nbdAttrBackendIdentifier, path)
+	}
+}
 
 type OverlayOptions struct {
 	Directory   string
@@ -216,7 +230,7 @@ func NewOverlay(ctx context.Context, o OverlayOptions) (*Overlay, error) {
 	overlay.socket = socket
 	slot, _ := strconv.ParseUint(strings.TrimPrefix(o.DevicePath, "/dev/nbd"), 10, 32)
 	overlay.deviceIndex = uint32(slot)
-	idx, err := nbdnl.Connect(uint32(slot), []*os.File{socket}, size, 0, nbdnl.ServerFlags(flags), nbdnl.WithBlockSize(512), nbdnl.WithTimeout(90*time.Second))
+	idx, err := nbdnl.Connect(uint32(slot), []*os.File{socket}, size, 0, nbdnl.ServerFlags(flags), nbdnl.WithBlockSize(512), nbdnl.WithTimeout(90*time.Second), withBackendIdentifier(path))
 	if err != nil {
 		return nil, errors.Join(err, overlay.abortStartup())
 	}

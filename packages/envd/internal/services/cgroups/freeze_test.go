@@ -4,12 +4,32 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestThawGuardAlsoBlocksWatchdog(t *testing.T) {
+	f := NewWorkloadFreezer(newFakeFreezeManager())
+	var allow atomic.Bool
+	f.SetThawGuard(allow.Load)
+	f.SetThawWatchdog(time.Hour, nil)
+	t.Cleanup(f.disarmWatchdog)
+	_, err := f.Freeze(t.Context(), FreezeOptions{MaxWait: time.Second})
+	require.NoError(t, err)
+	require.ErrorIs(t, f.Unfreeze(t.Context()), ErrThawHeld)
+	f.watchdogMu.Lock()
+	gen := f.watchdogGen
+	f.watchdogMu.Unlock()
+	_, _, err = f.thawForWatchdog(t.Context(), gen)
+	require.ErrorIs(t, err, ErrThawHeld)
+	require.True(t, f.freezeActive)
+	allow.Store(true)
+	require.NoError(t, f.Unfreeze(t.Context()))
+}
 
 // TestWorkloadFreezer_FreezeHoldBlocksUnfreeze verifies FreezeHold keeps the
 // shared lock held so a concurrent Unfreeze cannot thaw the workload until

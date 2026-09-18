@@ -322,12 +322,15 @@ func doBuild(
 		return fmt.Errorf("config: %w", err)
 	}
 
-	devicePool, err := nbd.NewDevicePool(c.NBDPoolSize)
-	if err != nil {
-		return fmt.Errorf("nbd pool: %w", err)
+	var devicePool *nbd.DevicePool
+	if !c.EROFSNativeOnly {
+		devicePool, err = nbd.NewDevicePool(c.NBDPoolSize)
+		if err != nil {
+			return fmt.Errorf("nbd pool: %w", err)
+		}
+		go devicePool.Populate(ctx)
+		defer devicePool.Close(parentCtx)
 	}
-	go devicePool.Populate(ctx)
-	defer devicePool.Close(parentCtx)
 
 	slotStorage, err := network.NewStorageLocal(ctx, networkConfig, tcpFirewall)
 	if err != nil {
@@ -356,7 +359,16 @@ func doBuild(
 	defer templateCache.Stop()
 
 	buildMetrics, _ := metrics.NewBuildMetrics(noop.MeterProvider{})
-	sandboxFactory := sandbox.NewFactory(ctx, c.BuilderConfig, networkPool, devicePool, featureFlags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
+	var sandboxFactory *sandbox.Factory
+	if c.EROFSNativeOnly {
+		sandboxFactory, err = sandbox.NewFileFactory(ctx, c.BuilderConfig, networkPool, featureFlags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
+		if err != nil {
+			return err
+		}
+	} else {
+		sandboxFactory = sandbox.NewFactory(ctx, c.BuilderConfig, networkPool, devicePool, featureFlags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
+	}
+	defer sandboxFactory.CloseSharedMounts(parentCtx)
 
 	// Layered V4 builds need the upload coordinator so child layers wait on
 	// their parents' header finalization. Redis is nil (CLI is single-host —

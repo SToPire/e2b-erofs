@@ -9,6 +9,8 @@ import (
 	"maps"
 	"time"
 
+	"github.com/google/uuid"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -188,6 +190,33 @@ func (ppb *PostProcessingBuilder) Build(
 		},
 	})
 
+	// Static user/permission setup must precede lower publication. With
+	// metacopy=off, running chmod/chown over /usr/local after pmem boot would
+	// copy executable data into each runtime's private upper.
+	if ppb.BuilderConfig.EROFSNativeOnly {
+		stageID := uuid.NewString()
+		stageMeta := currentLayer.Metadata.NewVersionTemplate(metadata.TemplateMetadata{BuildID: stageID, KernelVersion: ppb.Config.KernelVersion, FirecrackerVersion: ppb.Config.FirecrackerVersion})
+		stageHash := cache.HashKeys(currentLayer.Hash, "pmem-configure-before-lower", ppb.Template.BuildID)
+		configured, err := ppb.layerExecutor.BuildLayer(ctx, userLogger, layer.LayerBuildCommand{
+			SourceTemplate: layer.NewCacheSourceTemplateProvider(sourceLayer.Metadata.Template.BuildID),
+			CurrentLayer:   stageMeta, Hash: stageHash, UpdateEnvd: sourceLayer.Cached,
+			SandboxCreator: layer.NewCreateSandbox(sbxConfig, ppb.sandboxFactory, finalizeTimeout, layer.WithStandaloneRawBuild()),
+			ActionExecutor: layer.NewFunctionAction(func(ctx context.Context, sbx *sandbox.Sandbox, meta metadata.Template) (metadata.Template, error) {
+				if err := runConfiguration(ctx, userLogger, ppb.BuildContext, ppb.proxy, sbx.Runtime.SandboxID); err != nil {
+					return metadata.Template{}, err
+				}
+				if err := sandboxtools.SyncChangesToDisk(ctx, ppb.proxy, sbx.Runtime.SandboxID); err != nil {
+					return metadata.Template{}, err
+				}
+				return meta, nil
+			}), BuildOrigin: storage.ObjectOriginTemplateBuild,
+		})
+		if err != nil {
+			return phases.LayerResult{}, fmt.Errorf("configure raw staging before pmem finalization: %w", err)
+		}
+		sourceLayer = phases.LayerResult{Metadata: configured, Hash: stageHash, Cached: false}
+	}
+
 	// Select the IO Engine to use for the rootfs drive
 	ioEngine := ppb.featureFlags.StringFlag(
 		ctx,
@@ -201,11 +230,14 @@ func (ppb *PostProcessingBuilder) Build(
 	sandboxOptions := []layer.CreateSandboxOption{
 		layer.WithIoEngine(ioEngine),
 	}
-	if sourceLayer.Cached {
+	if sourceLayer.Cached && !ppb.BuilderConfig.EROFSNativeOnly {
 		sandboxOptions = append(sandboxOptions, layer.ReservedBlocksOptions(ctx, ppb.featureFlags, ppb.Config.RootfsBlockSize())...)
 	}
 	if ppb.BuilderConfig.EROFSSnapshotDir != "" {
 		sandboxOptions = append(sandboxOptions, layer.WithMinimumFreeDisk(ppb.Config.FreeDiskSizeMB, ppb.Config.RootfsBlockSize()))
+	}
+	if ppb.BuilderConfig.EROFSNativeOnly {
+		sandboxOptions = append(sandboxOptions, layer.WithPmemFinalization(ppb.Config.FreeDiskSizeMB, int64(max(0, ppb.featureFlags.IntFlag(ctx, featureflags.BuildReservedDiskSpaceMB)))))
 	}
 
 	// Always restart the sandbox for the final layer to properly wire the rootfs path for the final template
@@ -283,18 +315,22 @@ func (ppb *PostProcessingBuilder) postProcessingFn(userLogger logger.Logger) lay
 			}
 		}()
 
-		// Run configuration script
-		configCtx, configCancel := context.WithTimeout(ctx, configurationTimeout)
-		defer configCancel()
-		err := runConfiguration(
-			configCtx,
-			userLogger,
-			ppb.BuildContext,
-			ppb.proxy,
-			sbx.Runtime.SandboxID,
-		)
-		if err != nil {
-			return metadata.Template{}, phases.NewPhaseBuildError(ppb.Metadata(), fmt.Errorf("configuration script failed: %w", err))
+		var err error
+		if !ppb.BuilderConfig.EROFSNativeOnly {
+			// Run configuration script
+			configCtx, configCancel := context.WithTimeout(ctx, configurationTimeout)
+			defer configCancel()
+			err = runConfiguration(
+				configCtx,
+				userLogger,
+				ppb.BuildContext,
+				ppb.proxy,
+				sbx.Runtime.SandboxID,
+			)
+			if err != nil {
+				return metadata.Template{}, phases.NewPhaseBuildError(ppb.Metadata(), fmt.Errorf("configuration script failed: %w", err))
+			}
+
 		}
 
 		if meta.Start == nil {

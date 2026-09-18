@@ -244,6 +244,9 @@ func (f *Factory) RebootSandbox(
 	// not routable during the upgrade's pre-init auth window. Mirrors the resume
 	// path's WithDeferredLiveRegistration.
 	if !deferMarkRunning {
+		if err := sbx.CommitPmemResume(ctx); err != nil {
+			return nil, errors.Join(err, sbx.Close(context.WithoutCancel(ctx)))
+		}
 		f.Sandboxes.MarkRunning(ctx, sbx)
 
 		go sbx.Checks.Start(context.WithoutCancel(ctx))

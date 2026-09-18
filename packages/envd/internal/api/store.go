@@ -14,6 +14,7 @@ import (
 	"github.com/e2b-dev/infra/packages/envd/internal/host"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/cgroups"
 	"github.com/e2b-dev/infra/packages/envd/internal/services/fsfreeze"
+	"github.com/e2b-dev/infra/packages/envd/internal/services/pmemstate"
 	"github.com/e2b-dev/infra/packages/envd/internal/utils"
 )
 
@@ -39,6 +40,10 @@ type DefaultMMDSClient struct{}
 
 func (c *DefaultMMDSClient) GetAccessTokenHash(ctx context.Context) (string, error) {
 	return host.GetAccessTokenHashFromMMDS(ctx)
+}
+
+func (c *DefaultMMDSClient) GetResumeMetadata(ctx context.Context) (*host.MMDSOpts, error) {
+	return host.GetResumeMetadata(ctx)
 }
 
 type API struct {
@@ -69,6 +74,7 @@ type API struct {
 	// fsFreezeLock serializes /fsfreeze and /fsthaw.
 	fsFreezer    fsfreeze.Freezer
 	fsFreezeLock *semaphore.Weighted
+	pmem         pmemController
 
 	// handover, when non-nil, is the outcome of the live-upgrade handover this
 	// envd booted from; PostInit advertises it to the orchestrator via the
@@ -93,7 +99,28 @@ type API struct {
 
 // Initialized reports whether the first authenticated /init has completed.
 func (a *API) Initialized() bool {
-	return a.initialized.Load()
+	return a.initialized.Load() && (a.pmem == nil || a.pmem.Ready())
+}
+
+func (a *API) Authenticated() bool { return a.initialized.Load() }
+
+func (a *API) SetPmemController(controller *pmemstate.Controller) {
+	if controller == nil {
+		a.pmem = nil
+	} else {
+		a.pmem = controller
+	}
+}
+
+type pmemController interface {
+	Snapshot() pmemstate.State
+	Ready() bool
+	Mountpoint() string
+	BeginPrepare(string) (bool, error)
+	Prepared(string) error
+	SetFrozen(bool) error
+	Commit(string, func() error) error
+	HoldUpgrade() (func() error, error)
 }
 
 // handoverResult is the outcome of a live-upgrade handover, reported to the

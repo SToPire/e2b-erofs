@@ -43,10 +43,21 @@ func run() error {
 			return readErr
 		}
 		var req erofs.BuildRequest
-		if err := json.Unmarshal(data, &req); err != nil {
+		var tagged struct {
+			Version int                  `json:"version"`
+			Request erofs.BuildV2Request `json:"request"`
+		}
+		if err := json.Unmarshal(data, &tagged); err != nil {
 			return err
 		}
-		snapshot, err = store.Build(ctx, req)
+		if tagged.Version == 2 {
+			snapshot, err = store.PublishV2Request(ctx, tagged.Request)
+		} else {
+			if err := json.Unmarshal(data, &req); err != nil {
+				return err
+			}
+			snapshot, err = store.Build(ctx, req)
+		}
 	}
 	if err != nil {
 		return err

@@ -267,6 +267,15 @@ func (s *Store) Recover(ctx context.Context, path string) (snapshot *Snapshot, r
 		return nil, err
 	}
 	var record recoveryRecord
+	var version struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &version); err != nil {
+		return nil, err
+	}
+	if version.Version == 2 {
+		return s.recoverV2(ctx, path, data)
+	}
 	if err := json.Unmarshal(data, &record); err != nil {
 		return nil, err
 	}

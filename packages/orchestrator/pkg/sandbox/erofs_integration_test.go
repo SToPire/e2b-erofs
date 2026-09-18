@@ -78,6 +78,7 @@ func TestEROFSFactoryLifecycle(t *testing.T) { //nolint:paralleltest // Owns pri
 			"kernel": inputs["KERNEL"], "ram_bytes": int64(256 << 20), "disk_bytes": int64(64 << 20),
 			"envd_enabled": envdBinary != "", "retained_capture_retry": true, "concurrent_close": true, "qemu_failure_propagation": true,
 			"baseline_capture_retained_on_close": true,
+			"shared_memory_and_rootfs_mounts":    true, "shared_namespace_release": true,
 		}
 		if envdBinary != "" {
 			report["envd_sha256"] = fmt.Sprintf("%x", lifecycleHash(t, envdBinary))
@@ -178,6 +179,7 @@ func TestEROFSFactoryLifecycle(t *testing.T) { //nolint:paralleltest // Owns pri
 	netPool := &lifecycleNetworkPool{slots: make(map[string]*network.Slot), hostAccess: envdBinary != ""}
 	t.Cleanup(func() { require.NoError(t, netPool.Close(context.WithoutCancel(ctx))) })
 	factory := NewFactory(ctx, config, netPool, devices, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), nil, NewSandboxesMap())
+	t.Cleanup(func() { require.NoError(t, factory.CloseSharedMounts(context.Background())) })
 	newConfig := func() *Config {
 		config := NewConfig(Config{Vcpu: 1, RamMB: ramMB, TotalDiskSizeMB: diskSize >> 20, FirecrackerConfig: versions, SkipEnvdWait: envdBinary == ""})
 		if envdBinary != "" {
@@ -188,8 +190,9 @@ func TestEROFSFactoryLifecycle(t *testing.T) { //nolint:paralleltest // Owns pri
 		}
 		return config
 	}
+	teamID := uuid.NewString()
 	runtimeFor := func(id string) RuntimeMetadata {
-		return RuntimeMetadata{TemplateID: "erofs-test", SandboxID: "e" + uuid.NewString()[:8], ExecutionID: uuid.NewString(), BuildID: id, TeamID: uuid.NewString(), SandboxType: SandboxTypeBuild}
+		return RuntimeMetadata{TemplateID: "erofs-test", SandboxID: "e" + uuid.NewString()[:8], ExecutionID: uuid.NewString(), BuildID: id, TeamID: teamID, SandboxType: SandboxTypeBuild}
 	}
 	var sandboxes []*Sandbox
 	t.Cleanup(func() {
@@ -301,10 +304,41 @@ func TestEROFSFactoryLifecycle(t *testing.T) { //nolint:paralleltest // Owns pri
 	require.Equal(t, diskSize, snapshot0.LocalEROFS.Manifest.Disk.Size)
 	baselineDisk := lifecycleHash(t, rootfsPath)
 	first := resume(snapshot0)
+	baselineSibling := resume(snapshot0)
+	entries, err := os.ReadDir(factory.sharedMounts.Root())
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "same-generation runtimes share one memory/disk mount pair")
+	sharedBase := filepath.Join(factory.sharedMounts.Root(), entries[0].Name())
+	memoryPath := filepath.Join(sharedBase, "memory", "memory", "memfile")
+	diskPath := filepath.Join(sharedBase, "disk", "disk", "rootfs.ext4")
+	for _, s := range []*Sandbox{first, baselineSibling} {
+		lifecycleSharedMountIdentity(t, s, memoryPath, diskPath, factory.sharedMounts.Root())
+	}
+	firstDevice, err := first.rootfs.Path()
+	require.NoError(t, err)
+	siblingDevice, err := baselineSibling.rootfs.Path()
+	require.NoError(t, err)
+	require.NotEqual(t, firstDevice, siblingDevice, "writable NBD devices stay private")
+	baseMemoryHash, baseDiskHash := lifecycleHash(t, memoryPath), lifecycleHash(t, diskPath)
 	one := lifecycleGuestState{Generation: 1, Memory: [3]int{0xa6, 0, 0x53}, Disk: [3]int{0xa6, 0, 0x53}, Partial: 0x53}
 	lifecycleState(t, ctx, first, "/write/1", one)
+	lifecycleState(t, ctx, baselineSibling, "/state", lifecycleGuestState{Memory: [3]int{0x31, 0x42, 0x53}, Disk: [3]int{0x31, 0x42, 0x53}, Partial: 0x53})
+	require.Equal(t, baseMemoryHash, lifecycleHash(t, memoryPath))
+	require.Equal(t, baseDiskHash, lifecycleHash(t, diskPath))
 	snapshot1 := checkpoint(first, snapshot0.BuildID.String(), true)
+	require.FileExists(t, memoryPath, "sibling's reference retains old generation after checkpoint")
 	second := resume(snapshot1)
+	lifecycleState(t, ctx, second, "/state", one)
+	// This newer FC was spawned while G0 was mounted. Its namespace must not
+	// pin G0 after the last G0 runtime exits.
+	require.NoError(t, baselineSibling.Close(ctx))
+	_, err = os.Stat(sharedBase)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	pid, err := second.process.Pid()
+	require.NoError(t, err)
+	mountinfo, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", pid))
+	require.NoError(t, err)
+	require.NotContains(t, string(mountinfo), factory.sharedMounts.Root()+"/")
 	lifecycleState(t, ctx, second, "/state", one)
 	two := lifecycleGuestState{Generation: 2, Memory: [3]int{0xa6, 0, 0xb7}, Disk: [3]int{0xa6, 0, 0x53}, Partial: 0xb7}
 	lifecycleState(t, ctx, second, "/write/2", two)
@@ -386,6 +420,32 @@ func TestEROFSFactoryLifecycle(t *testing.T) { //nolint:paralleltest // Owns pri
 	}
 	require.NoError(t, crashed.Close(ctx))
 	t.Log("Factory Create/Pause/Resume: two generations, branch isolation, retained capture retry, concurrent Close and QEMU crash propagation passed")
+}
+
+func lifecycleSharedMountIdentity(t *testing.T, s *Sandbox, memoryPath, diskPath, sharedRoot string) string {
+	t.Helper()
+	pid, err := s.process.Pid()
+	require.NoError(t, err)
+	boundPath := filepath.Join(s.config.SandboxDir, s.Config.FirecrackerConfig.SandboxKernelDir(), "memfile")
+	memory, err := os.Stat(memoryPath)
+	require.NoError(t, err)
+	bound, err := os.Stat(fmt.Sprintf("/proc/%d/root%s", pid, boundPath))
+	require.NoError(t, err)
+	require.True(t, os.SameFile(memory, bound), "FC bind must preserve shared RAM inode")
+	info, err := s.rootfs.(*erofsRootfs).overlay.RecoveryInfo()
+	require.NoError(t, err)
+	require.Equal(t, diskPath, info.BackingPath)
+	nbdPath, err := s.rootfs.Path()
+	require.NoError(t, err)
+	backend, err := os.ReadFile(filepath.Join("/sys/class/block", filepath.Base(nbdPath), "backend"))
+	require.NoError(t, err)
+	// sysfs appends one newline; preserve all bytes of the qcow2 path itself.
+	kernelBackend := strings.TrimSuffix(string(backend), "\n")
+	require.Equal(t, info.Path, kernelBackend, "kernel NBD backend must identify this runtime's qcow2")
+	mountinfo, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", pid))
+	require.NoError(t, err)
+	require.NotContains(t, string(mountinfo), sharedRoot+"/", "FC retains only its private RAM bind")
+	return kernelBackend
 }
 
 func lifecycleQEMU(t *testing.T, overlayRoot string) *os.Process {

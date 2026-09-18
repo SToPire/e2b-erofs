@@ -12,10 +12,12 @@ import (
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/erofs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	sbxtemplate "github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/template"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/config"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/filesystem"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/pmem"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/constants"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
 	"github.com/e2b-dev/infra/packages/shared/pkg/fc/models"
@@ -34,6 +36,9 @@ type CreateSandbox struct {
 	rootfsCachePath string
 	ioEngine        *string
 	preBootFn       sandbox.PreBootFn
+	pmemFreeDiskMB  *int64
+	pmemReservedMB  int64
+	standaloneRaw   bool
 }
 
 const (
@@ -47,6 +52,21 @@ type createSandboxOptions struct {
 	rootfsCachePath string
 	ioEngine        *string
 	preBootFn       sandbox.PreBootFn
+	pmemFreeDiskMB  *int64
+	pmemReservedMB  int64
+	standaloneRaw   bool
+}
+
+// WithStandaloneRawBuild flattens a pmem parent into a cold raw build disk so
+// static configuration never copies entire lower files into a bounded upper.
+func WithStandaloneRawBuild() CreateSandboxOption {
+	return func(opts *createSandboxOptions) { opts.standaloneRaw = true }
+}
+
+// WithPmemFinalization converts the sealed build disk to a shared lower and a
+// fresh upper, then cold-boots the final layout before start/ready and capture.
+func WithPmemFinalization(freeDiskMB, reservedMB int64) CreateSandboxOption {
+	return func(opts *createSandboxOptions) { opts.pmemFreeDiskMB = &freeDiskMB; opts.pmemReservedMB = reservedMB }
 }
 
 type CreateSandboxOption func(*createSandboxOptions)
@@ -145,6 +165,9 @@ func NewCreateSandbox(config *sandbox.Config, sandboxFactory *sandbox.Factory, t
 		sandboxFactory:  sandboxFactory,
 		ioEngine:        opts.ioEngine,
 		preBootFn:       opts.preBootFn,
+		pmemFreeDiskMB:  opts.pmemFreeDiskMB,
+		pmemReservedMB:  opts.pmemReservedMB,
+		standaloneRaw:   opts.standaloneRaw,
 	}
 }
 
@@ -153,6 +176,59 @@ func (cs *CreateSandbox) Sandbox(
 	layerExecutor *LayerExecutor,
 	sourceTemplate sbxtemplate.Template,
 ) (s *sandbox.Sandbox, err error) {
+	var factoryOptions []sandbox.CreateOption
+	if cs.standaloneRaw {
+		if cs.pmemFreeDiskMB != nil {
+			return nil, errors.New("raw staging and pmem finalization are separate boots")
+		}
+		if source, ok := sbxtemplate.EROFS(sourceTemplate); ok && source.Manifest.Boot != nil && source.Manifest.Boot.Layout == erofs.LayoutPmem {
+			store, err := erofs.NewStore(layerExecutor.BuilderConfig.EROFSSnapshotDir, erofs.Options{MkfsPath: layerExecutor.BuilderConfig.EROFSMkfsPath})
+			if err != nil {
+				return nil, err
+			}
+			boot, err := pmem.BootArtifacts(ctx, store, layerExecutor.BuilderConfig, cs.config.FirecrackerConfig)
+			if err != nil {
+				return nil, err
+			}
+			merged, err := cs.sandboxFactory.ExportPmemRootfs(ctx, sourceTemplate, boot, layerExecutor.Config.TeamID)
+			if err != nil {
+				return nil, err
+			}
+			defer merged.Close()
+			factoryOptions = append(factoryOptions, sandbox.WithRawBootstrap(sandbox.RawBootstrap{Path: merged.Path, Size: merged.Size, SHA256: merged.SHA256}))
+		}
+	}
+	if cs.pmemFreeDiskMB != nil {
+		source, ok := sbxtemplate.EROFS(sourceTemplate)
+		if !ok {
+			return nil, errors.New("pmem finalization requires a committed EROFS build")
+		}
+		store, err := erofs.NewStore(layerExecutor.BuilderConfig.EROFSSnapshotDir, erofs.Options{MkfsPath: layerExecutor.BuilderConfig.EROFSMkfsPath})
+		if err != nil {
+			return nil, err
+		}
+		boot, err := pmem.BootArtifacts(ctx, store, layerExecutor.BuilderConfig, cs.config.FirecrackerConfig)
+		if err != nil {
+			return nil, err
+		}
+		inputs := pmem.Inputs{Source: source, Store: store, Boot: boot, FreeDiskMB: *cs.pmemFreeDiskMB, ReservedMB: cs.pmemReservedMB}
+		if source.Manifest.Boot != nil && source.Manifest.Boot.Layout == erofs.LayoutPmem {
+			merged, err := cs.sandboxFactory.ExportPmemRootfs(ctx, sourceTemplate, boot, layerExecutor.Config.TeamID)
+			if err != nil {
+				return nil, err
+			}
+			defer merged.Close()
+			inputs.Source = nil
+			inputs.Raw = &pmem.RawInput{Path: merged.Path, Size: merged.Size, SHA256: merged.SHA256}
+		}
+		prepared, err := pmem.Prepare(ctx, inputs)
+		if err != nil {
+			return nil, err
+		}
+		defer prepared.Close()
+		factoryOptions = append(factoryOptions, sandbox.WithPmemBootstrap(sandbox.PmemBootstrap{Boot: prepared.Boot, Lower: prepared.Lower,
+			UpperPath: prepared.UpperPath, UpperSize: prepared.UpperSize, UpperContentSHA256: prepared.UpperSHA256}))
+	}
 	// Create new memfile with the size of the sandbox RAM, this updates the underlying memfile.
 	// This is ok as the sandbox is started from the beginning.
 	memfile, err := block.NewEmpty(
@@ -202,6 +278,7 @@ func (cs *CreateSandbox) Sandbox(
 		},
 		nil,
 		cs.preBootFn,
+		factoryOptions...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create sandbox: %w", err)

@@ -1235,15 +1235,18 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	go networkPool.Populate(ctx)
 	defer networkPool.Close(context.WithoutCancel(ctx))
 
-	if verbose {
-		fmt.Println("🔧 Creating NBD device pool...")
+	var devicePool *nbd.DevicePool
+	if !config.EROFSNativeOnly {
+		if verbose {
+			fmt.Println("Creating NBD device pool...")
+		}
+		devicePool, err = nbd.NewDevicePool(config.NBDPoolSize)
+		if err != nil {
+			return fmt.Errorf("nbd pool: %w", err)
+		}
+		go devicePool.Populate(ctx)
+		defer devicePool.Close(context.WithoutCancel(ctx))
 	}
-	devicePool, err := nbd.NewDevicePool(config.NBDPoolSize)
-	if err != nil {
-		return fmt.Errorf("nbd pool: %w", err)
-	}
-	go devicePool.Populate(ctx)
-	defer devicePool.Close(context.WithoutCancel(ctx))
 
 	if verbose {
 		fmt.Println("🔧 Creating storage provider...")
@@ -1305,7 +1308,16 @@ func run(ctx context.Context, buildID string, iterations int, coldStart, noPrefe
 	if verbose {
 		fmt.Println("🔧 Creating sandbox factory...")
 	}
-	factory := sandbox.NewFactory(ctx, config.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), egressProxy, sandbox.NoopNetworkAssignHook{}, sandboxes)
+	var factory *sandbox.Factory
+	if config.EROFSNativeOnly {
+		factory, err = sandbox.NewFileFactory(ctx, config.BuilderConfig, networkPool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), egressProxy, sandbox.NoopNetworkAssignHook{}, sandboxes)
+		if err != nil {
+			return err
+		}
+	} else {
+		factory = sandbox.NewFactory(ctx, config.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), egressProxy, sandbox.NoopNetworkAssignHook{}, sandboxes)
+	}
+	defer factory.CloseSharedMounts(context.WithoutCancel(ctx))
 
 	fmt.Printf("📦 Loading %s...\n", buildID)
 	tmpl, err := cache.GetTemplate(ctx, buildID, false, false)

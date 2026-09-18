@@ -32,6 +32,7 @@ var reservedCmdlineParams = map[string]struct{}{
 	"reboot":      {},
 	"loglevel":    {},
 	"quiet":       {},
+	"rdinit":      {},
 }
 
 // ParseCmdlineArgs parses a guest kernel command line fragment the way the kernel itself does:
@@ -70,6 +71,9 @@ func ParseCmdlineArgs(fragment string) (map[string]string, error) {
 // back to the default command line, a state that has been running in production all along.
 func ValidateCmdlineArgs(args map[string]string) error {
 	for _, name := range slices.Sorted(maps.Keys(args)) {
+		if strings.HasPrefix(name, "e2b.") {
+			return fmt.Errorf("guest kernel cmdline parameter %q is reserved by the orchestrator", name)
+		}
 		if _, reserved := reservedCmdlineParams[name]; reserved {
 			return fmt.Errorf("guest kernel cmdline parameter %q is reserved by the orchestrator", name)
 		}

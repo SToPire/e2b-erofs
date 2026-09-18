@@ -9,4 +9,6 @@ type MmdsMetadata struct {
 
 	LogsCollectorAddress string `json:"address"`
 	AccessTokenHash      string `json:"accessTokenHash,omitempty"`
+	LifecycleID          string `json:"lifecycleID,omitempty"`
+	RootfsLayout         string `json:"rootfsLayout,omitempty"`
 }

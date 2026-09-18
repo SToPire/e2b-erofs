@@ -60,6 +60,24 @@ func (e PostFreezeParamsMode) Valid() bool {
 	}
 }
 
+// Defines values for PostInitJSONBodyResumePhase.
+const (
+	Commit  PostInitJSONBodyResumePhase = "commit"
+	Prepare PostInitJSONBodyResumePhase = "prepare"
+)
+
+// Valid indicates whether the value is a known member of the PostInitJSONBodyResumePhase enum.
+func (e PostInitJSONBodyResumePhase) Valid() bool {
+	switch e {
+	case Commit:
+		return true
+	case Prepare:
+		return true
+	default:
+		return false
+	}
+}
+
 // CollapseResult Per-call statistics from a heap collapse
 type CollapseResult struct {
 	// AlreadyHuge Chunks MADV_COLLAPSE accepted but were already hugepages (no work)
@@ -335,10 +353,16 @@ type PostInitJSONBody struct {
 	// LifecycleID Lifecycle ID of the sandbox
 	LifecycleID string `json:"lifecycleID,omitempty"`
 
+	// ResumePhase Pmem rootfs restore phase; prepare authenticates and thaws upper before initialization, commit releases workloads after initialization and upgrade.
+	ResumePhase PostInitJSONBodyResumePhase `json:"resumePhase,omitempty"`
+
 	// Timestamp The current timestamp in RFC3339 format
 	Timestamp    time.Time     `json:"timestamp,omitempty"`
 	VolumeMounts []VolumeMount `json:"volumeMounts,omitempty"`
 }
+
+// PostInitJSONBodyResumePhase defines parameters for PostInit.
+type PostInitJSONBodyResumePhase string
 
 // PostFilesMultipartRequestBody defines body for PostFiles for multipart/form-data ContentType.
 type PostFilesMultipartRequestBody PostFilesMultipartBody

@@ -206,10 +206,13 @@ func newTestInfra(t *testing.T, ctx context.Context) *testInfra {
 	require.NoError(t, err)
 
 	// NBD
-	devicePool, err := nbd.NewDevicePool(orcConfig.NBDPoolSize)
-	require.NoError(t, err)
-	go devicePool.Populate(ctx)
-	ti.closers = append(ti.closers, func(ctx context.Context) { devicePool.Close(ctx) })
+	var devicePool *nbd.DevicePool
+	if !orcConfig.EROFSNativeOnly {
+		devicePool, err = nbd.NewDevicePool(orcConfig.NBDPoolSize)
+		require.NoError(t, err)
+		go devicePool.Populate(ctx)
+		ti.closers = append(ti.closers, func(ctx context.Context) { devicePool.Close(ctx) })
+	}
 
 	// Sandbox proxy + TCP firewall
 	sandboxes := sandbox.NewSandboxesMap()
@@ -247,7 +250,14 @@ func newTestInfra(t *testing.T, ctx context.Context) *testInfra {
 	ti.closers = append(ti.closers, func(ctx context.Context) { sandboxProxy.Close(ctx) })
 
 	// Factory + Builder
-	factory := sandbox.NewFactory(ctx, orcConfig.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
+	var factory *sandbox.Factory
+	if orcConfig.EROFSNativeOnly {
+		factory, err = sandbox.NewFileFactory(ctx, orcConfig.BuilderConfig, networkPool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
+		require.NoError(t, err)
+	} else {
+		factory = sandbox.NewFactory(ctx, orcConfig.BuilderConfig, networkPool, devicePool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), sandbox.NoopNetworkAssignHook{}, sandboxes)
+	}
+	ti.closers = append(ti.closers, func(ctx context.Context) { factory.CloseSharedMounts(ctx) })
 	ti.factory = factory
 
 	buildMetrics, _ := metrics.NewBuildMetrics(noop.MeterProvider{})

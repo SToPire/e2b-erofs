@@ -383,7 +383,10 @@ func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequ
 	// has run its post-/init and restored the access token — so the sandbox is
 	// never routable during the upgrade's sub-second pre-init auth window. Both
 	// the resume and reboot paths above defer this.
-	s.markSandboxLive(ctx, sbx)
+	if err := s.markSandboxLive(ctx, sbx); err != nil {
+		s.stopSandboxAsync(context.WithoutCancel(ctx), sbx)
+		return nil, err
+	}
 
 	// Read scheduling metadata after the sandbox resumed so the template's
 	// memfile/rootfs devices (and their headers) are resolved.
@@ -1397,7 +1400,10 @@ func (s *Server) checkpointResumeFresh(ctx context.Context, sbx *sandbox.Sandbox
 
 	// Promote to the live registry now that any resume-time upgrade's post-/init
 	// has restored auth — the sandbox was resumed with routing deferred.
-	s.markSandboxLive(ctx, resumedSbx)
+	if err := s.markSandboxLive(ctx, resumedSbx); err != nil {
+		s.stopSandboxAsync(context.WithoutCancel(ctx), resumedSbx)
+		return nil, err
+	}
 
 	// Embed prefetch data into the metadata so it's uploaded with the snapshot files in a single pass.
 	if prefetchErr == nil {
@@ -1666,10 +1672,14 @@ func (s *Server) uploadSnapshotAsync(ctx context.Context, sbx *sandbox.Sandbox, 
 // resume with routing deferred and call this only after maybeUpgradeEnvd has
 // completed its post-/init, so the sandbox never appears in routing during the
 // upgrade's pre-init auth window. Idempotent — MarkRunning is InsertIfAbsent.
-func (s *Server) markSandboxLive(ctx context.Context, sbx *sandbox.Sandbox) {
+func (s *Server) markSandboxLive(ctx context.Context, sbx *sandbox.Sandbox) error {
+	if err := sbx.CommitPmemResume(ctx); err != nil {
+		return err
+	}
 	s.sandboxFactory.Sandboxes.MarkRunning(ctx, sbx)
 
 	go sbx.Checks.Start(context.WithoutCancel(ctx))
+	return nil
 }
 
 func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox) {

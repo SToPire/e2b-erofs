@@ -20,6 +20,7 @@ import (
 func setupTestEnvironment(t *testing.T) (sourceDir, targetBaseDir, workDir string) {
 	t.Helper()
 	tmpBase := t.TempDir()
+	workDir = tmpBase
 	sourceDir = filepath.Join(tmpBase, "source")
 	targetBaseDir = filepath.Join(tmpBase, "target")
 
@@ -930,6 +931,8 @@ func TestCopyScriptBehavior(t *testing.T) { //nolint:paralleltest // no idea why
 				TargetPath:  targetPathOrFile,
 				Owner:       owner,
 				Permissions: tc.permissions,
+				Workdir:     workDir,
+				User:        fmt.Sprint(uid),
 			})
 
 			// Execute script

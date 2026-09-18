@@ -28,6 +28,7 @@ type startScriptArgs struct {
 	NamespaceID       string
 	FirecrackerPath   string
 	FirecrackerSocket string
+	SharedMountScript string
 }
 
 // StartScriptResult contains the generated script and computed paths
@@ -40,6 +41,11 @@ type StartScriptResult struct {
 
 	// KernelPath is the computed kernel path
 	KernelPath string
+
+	// MemoryPath is the File backend path inside the FC namespace.
+	MemoryPath    string
+	InitramfsPath string
+	pmem          *preparedPmemRootfs
 }
 
 const startScriptV1 = `mount --make-rprivate / &&
@@ -50,7 +56,8 @@ ln -s {{ .HostRootfsPath }} {{ .DeprecatedSandboxRootfsDir }}/{{ .SandboxRootfsF
 mount -t tmpfs tmpfs {{ .SandboxDir }}/{{ .SandboxKernelDir }} -o X-mount.mkdir &&
 ln -s {{ .HostKernelPath }} {{ .SandboxDir }}/{{ .SandboxKernelDir }}/{{ .SandboxKernelFile }} &&
 
-ip netns exec {{ .NamespaceID }} {{ .FirecrackerPath }} --api-sock {{ .FirecrackerSocket }}`
+{{ if .SharedMountScript }}{{ .SharedMountScript }} &&
+{{ end }}ip netns exec {{ .NamespaceID }} {{ .FirecrackerPath }} --api-sock {{ .FirecrackerSocket }}`
 
 const startScriptV2 = `mount --make-rprivate / &&
 mount -t tmpfs tmpfs {{ .SandboxDir }} -o X-mount.mkdir &&
@@ -60,7 +67,8 @@ ln -s {{ .HostRootfsPath }} {{ .SandboxDir }}/{{ .SandboxRootfsFile }} &&
 mkdir -p {{ .SandboxDir }}/{{ .SandboxKernelDir }} &&
 ln -s {{ .HostKernelPath }} {{ .SandboxDir }}/{{ .SandboxKernelDir }}/{{ .SandboxKernelFile }} &&
 
-ip netns exec {{ .NamespaceID }} {{ .FirecrackerPath }} --api-sock {{ .FirecrackerSocket }}`
+{{ if .SharedMountScript }}{{ .SharedMountScript }} &&
+{{ end }}ip netns exec {{ .NamespaceID }} {{ .FirecrackerPath }} --api-sock {{ .FirecrackerSocket }}`
 
 // StartScriptBuilder handles the creation and execution of firecracker start scripts
 type StartScriptBuilder struct {
@@ -135,8 +143,39 @@ func (sb *StartScriptBuilder) Build(
 	files *storage.SandboxFiles,
 	rootfsPaths RootfsPaths,
 	namespaceID string,
+	memorySources ...RuntimeSources,
 ) (*StartScriptResult, error) {
 	args := sb.buildArgs(versions, files, rootfsPaths, namespaceID)
+	if len(memorySources) > 1 {
+		return nil, fmt.Errorf("only one native memory source is allowed")
+	}
+	if len(memorySources) == 1 && memorySources[0].RawDisk && (!versions.NativeMemory || memorySources[0].Rootfs != nil) {
+		return nil, fmt.Errorf("raw build disk requires native memory and cannot also select pmem rootfs")
+	}
+	if len(memorySources) == 1 && memorySources[0].Rootfs != nil {
+		if rootfsPaths.TemplateVersion <= 1 {
+			return nil, fmt.Errorf("pmem rootfs cannot use legacy namespace paths")
+		}
+		return sb.buildPmemScript(versions, files, namespaceID, memorySources[0])
+	}
+	var hostMemory, memoryPath, sharedRoot string
+	if len(memorySources) == 1 {
+		hostMemory = memorySources[0].MemoryPath
+		if hostMemory != "" {
+			if !versions.NativeMemory {
+				return nil, fmt.Errorf("shared memory source requires native File restore")
+			}
+			memoryPath = filepath.Join(args.SandboxDir, args.SandboxKernelDir, "memfile")
+		}
+	}
+	if sb.builderConfig.EROFSSnapshotDir != "" {
+		sharedRoot = filepath.Join(sb.builderConfig.EROFSSnapshotDir, ".shared-mounts")
+	}
+	sharedScript, err := sharedMountScript(sharedRoot, hostMemory, memoryPath)
+	if err != nil {
+		return nil, err
+	}
+	args.SharedMountScript = sharedScript
 
 	script, err := sb.GenerateScript(args, rootfsPaths)
 	if err != nil {
@@ -150,6 +189,7 @@ func (sb *StartScriptBuilder) Build(
 		Value:      script,
 		RootfsPath: rootfsPath,
 		KernelPath: kernelPath,
+		MemoryPath: memoryPath,
 	}, nil
 }
 

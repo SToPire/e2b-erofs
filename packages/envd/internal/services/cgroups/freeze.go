@@ -152,8 +152,10 @@ const HandoverMaxWait = 2 * time.Second
 // A single WorkloadFreezer instance must be shared by all of those callers for
 // the serialization to hold; construct one and pass it to each.
 type WorkloadFreezer struct {
-	mgr  Manager
-	lock *semaphore.Weighted
+	mgr         Manager
+	lock        *semaphore.Weighted
+	thawGuardMu sync.RWMutex
+	thawGuard   func() bool
 
 	// thawMu guards thawedCh, the channel closed on the next Unfreeze. It lets
 	// callers block until the workload is next thawed (see Thawed).
@@ -203,6 +205,14 @@ type WorkloadFreezer struct {
 	// clean, disarm the timer belonging to it -- undoing a freeze and removing its backstop
 	// in one go. The generation is what makes a superseded fire a no-op.
 	watchdogGen uint64
+}
+
+var ErrThawHeld = errors.New("workload thaw is held by the rootfs resume protocol")
+
+func (f *WorkloadFreezer) SetThawGuard(guard func() bool) {
+	f.thawGuardMu.Lock()
+	defer f.thawGuardMu.Unlock()
+	f.thawGuard = guard
 }
 
 // SetThawWatchdog arms a backstop: if a freeze is not followed by a thaw within window,
@@ -1112,6 +1122,12 @@ func (f *WorkloadFreezer) UnfreezeReporting(ctx context.Context, maxCgroups int)
 // staleness decision inside the same critical section as the thaw itself. Callers must hold
 // f.lock.
 func (f *WorkloadFreezer) unfreezeLocked(maxCgroups int) (ThawResult, error) {
+	f.thawGuardMu.RLock()
+	guard := f.thawGuard
+	f.thawGuardMu.RUnlock()
+	if guard != nil && !guard() {
+		return ThawResult{}, ErrThawHeld
+	}
 	// Cleared up front, before any cgroup is touched: from here on the tree no longer holds
 	// the state the sweep produced, so nothing may audit against it. Unconditional on the
 	// outcome, unlike freezeActive below -- a partial thaw has still destroyed the pre-thaw

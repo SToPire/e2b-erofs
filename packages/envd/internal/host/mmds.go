@@ -36,6 +36,8 @@ type MMDSOpts struct {
 	TemplateID           string `json:"envID"`
 	LogsCollectorAddress string `json:"address"`
 	AccessTokenHash      string `json:"accessTokenHash"`
+	LifecycleID          string `json:"lifecycleID"`
+	RootfsLayout         string `json:"rootfsLayout"`
 }
 
 func (opts *MMDSOpts) AddOptsToJSON(jsonLogs []byte) ([]byte, error) {
@@ -127,6 +129,16 @@ func GetAccessTokenHashFromMMDS(ctx context.Context) (string, error) {
 	}
 
 	return opts.AccessTokenHash, nil
+}
+
+// GetResumeMetadata reads token hash and lifecycle/layout in one MMDS response.
+// Phased resume must not combine identity fields fetched from different views.
+func GetResumeMetadata(ctx context.Context) (*MMDSOpts, error) {
+	token, err := getMMDSToken(ctx, mmdsAccessTokenClient)
+	if err != nil {
+		return nil, err
+	}
+	return getMMDSOpts(ctx, mmdsAccessTokenClient, token)
 }
 
 func PollForMMDSOpts(ctx context.Context, mmdsChan chan<- *MMDSOpts, envVars *utils.EnvVars) {

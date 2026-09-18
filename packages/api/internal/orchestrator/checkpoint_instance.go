@@ -83,13 +83,10 @@ func (o *Orchestrator) CheckpointSandbox(ctx context.Context, teamID uuid.UUID, 
 		Metadata:  map[string]string{storageopts.ObjectMetadataTemplateID: upsertResult.TemplateID},
 	})
 	if intent != nil {
-		if receiptErr := o.observeCheckpointResult(ctx, intent, err); receiptErr != nil {
-			err = errors.Join(err, receiptErr)
-		}
-		// Release this callback before the reconciler applies an execution-pinned
-		// transition. Unknown outcomes remain Snapshotting, never presumed live.
-		finish(errCheckpointPending)
-		if err := o.finishNativeCheckpoint(ctx, *intent, err); err != nil {
+		// Transfer callback ownership before starting the deadline-aware worker.
+		// The deferred finish must not wait on the worker's transition release.
+		once.Do(func() {})
+		if err := o.finishNativeCheckpoint(ctx, *intent, err, finishSnapshotting); err != nil {
 			return err
 		}
 		telemetry.ReportEvent(ctx, "Checkpointed sandbox")

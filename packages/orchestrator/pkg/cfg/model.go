@@ -25,6 +25,9 @@ type BuilderConfig struct {
 	// persistent local storage, outside the disposable template/build caches.
 	EROFSSnapshotDir          string `env:"EROFS_SNAPSHOT_DIR"`
 	EROFSNativeMemoryVerified bool   `env:"EROFS_NATIVE_MEMORY_VERIFIED" envDefault:"false"`
+	EROFSPmemVerified         bool   `env:"EROFS_PMEM_VERIFIED" envDefault:"false"`
+	EROFSPmemInitramfsPath    string `env:"EROFS_PMEM_INITRAMFS_PATH"`
+	EROFSNativeOnly           bool   `env:"EROFS_NATIVE_ONLY" envDefault:"false"`
 	EROFSMkfsPath             string `env:"EROFS_MKFS_PATH" envDefault:"mkfs.erofs"`
 	DomainName                string `env:"DOMAIN_NAME"              envDefault:""`
 	FirecrackerVersionsDir    string `env:"FIRECRACKER_VERSIONS_DIR" envDefault:"/fc-versions"`
@@ -48,6 +51,7 @@ type BuilderConfig struct {
 func makePathsAbsolute(c *BuilderConfig) error {
 	for _, item := range []*string{
 		&c.EROFSSnapshotDir,
+		&c.EROFSPmemInitramfsPath,
 		&c.DefaultCacheDir,
 		&c.FirecrackerVersionsDir,
 		&c.HostBusyboxDir,
@@ -78,6 +82,9 @@ func makePathsAbsolute(c *BuilderConfig) error {
 		*item = dir
 	}
 
+	if c.EROFSNativeOnly && (c.EROFSSnapshotDir == "" || !c.EROFSNativeMemoryVerified || !c.EROFSPmemVerified) {
+		return fmt.Errorf("EROFS_NATIVE_ONLY requires an EROFS store and verified native-memory/pmem support")
+	}
 	if c.EROFSSnapshotDir != "" {
 		if !c.EROFSNativeMemoryVerified {
 			return fmt.Errorf("EROFS_SNAPSHOT_DIR requires EROFS_NATIVE_MEMORY_VERIFIED after testing the deployed Firecracker binary")

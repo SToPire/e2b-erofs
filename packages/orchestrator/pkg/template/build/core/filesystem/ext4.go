@@ -51,6 +51,8 @@ const (
 type MakeOptions struct {
 	// DirIndex keeps the htree directory index mkfs.ext4 enables by default.
 	DirIndex bool
+	// DAX rejects ext4 filesystems carrying the inline_data incompat feature.
+	NoInlineData bool
 }
 
 func Make(ctx context.Context, rootfsPath string, sizeMb int64, blockSize int64, opts MakeOptions) error {
@@ -73,10 +75,13 @@ func Make(ctx context.Context, rootfsPath string, sizeMb int64, blockSize int64,
 		"filetype",
 		"flex_bg",
 		"huge_file",
-		// Pack file data <~160 B inside the inode to avoid a 4 KiB data block per tiny file.
-		"inline_data",
 		"large_file",
 		"sparse_super2",
+	}
+	if opts.NoInlineData {
+		features = append(features, "^inline_data")
+	} else {
+		features = append(features, "inline_data")
 	}
 	if !opts.DirIndex {
 		// dir_index is a mkfs.ext4 base feature, so turning it off means stripping it.

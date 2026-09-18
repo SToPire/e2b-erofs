@@ -3,6 +3,9 @@
 package build
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -48,6 +51,7 @@ import (
 	buildconfig "github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/config"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/metrics"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/sandboxtools"
+	buildpaths "github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/storage/paths"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/metadata"
 	artifactsregistry "github.com/e2b-dev/infra/packages/shared/pkg/artifacts-registry"
 	"github.com/e2b-dev/infra/packages/shared/pkg/dockerhub"
@@ -71,12 +75,23 @@ func TestEROFSBuilderOCI(t *testing.T) { //nolint:paralleltest // Privileged VM 
 		t.Skip("set E2B_EROFS_BUILDER_IMAGE and native VM tool paths")
 	}
 	require.Zero(t, os.Geteuid())
+	pmemMode := os.Getenv("E2B_PMEM_BUILDER") == "1"
+	agentTemplate := os.Getenv("E2B_PMEM_AGENT_TEMPLATE") == "1"
+	memoryMB := int64(512)
+	if agentTemplate {
+		require.True(t, pmemMode)
+		memoryMB = 2048
+	}
+	if pmemMode {
+		_, err := os.Stat("/sys/module/nbd")
+		require.ErrorIs(t, err, os.ErrNotExist, "NBD must be absent")
+	}
 	inputs := make(map[string]string)
 	for _, key := range []string{"FC", "KERNEL", "MKFS", "FSCK", "ENVD", "BUSYBOX_DIR", "TEST_DIR"} {
 		inputs[key] = os.Getenv("E2B_EROFS_" + key)
 		require.NotEmpty(t, inputs[key], key)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Minute)
 	defer cancel()
 	work, err := os.MkdirTemp(inputs["TEST_DIR"], "builder-")
 	require.NoError(t, err)
@@ -128,6 +143,11 @@ func TestEROFSBuilderOCI(t *testing.T) { //nolint:paralleltest // Privileged VM 
 		OrchestratorBaseDir: filepath.Join(work, "orchestrator"), SandboxDir: filepath.Join(work, "fc-vm"),
 		StorageConfig: storage.Config{SandboxCacheDir: filepath.Join(work, "sandbox-cache"), TemplateCacheDir: filepath.Join(work, "template-cache")},
 	}}
+	if pmemMode {
+		config.EROFSNativeOnly, config.EROFSPmemVerified = true, true
+		config.EROFSPmemInitramfsPath = os.Getenv("E2B_PMEM_INITRD")
+		require.NotEmpty(t, config.EROFSPmemInitramfsPath)
+	}
 	for _, path := range []string{config.EROFSSnapshotDir, config.DefaultCacheDir, config.TemplatesDir, config.StorageConfig.SandboxCacheDir, config.StorageConfig.TemplateCacheDir,
 		filepath.Join(config.FirecrackerVersionsDir, versions.FirecrackerVersion), filepath.Join(config.HostKernelsDir, versions.KernelVersion), filepath.Join(work, "bin")} {
 		require.NoError(t, os.MkdirAll(path, 0o755))
@@ -152,15 +172,25 @@ func TestEROFSBuilderOCI(t *testing.T) { //nolint:paralleltest // Privileged VM 
 	require.NoError(t, err)
 	cache.Start(ctx)
 	t.Cleanup(cache.Stop)
-	devices, err := nbd.NewDevicePool(2)
-	require.NoError(t, err)
-	poolCtx, cancelPool := context.WithCancel(context.WithoutCancel(ctx))
-	go devices.Populate(poolCtx)
-	t.Cleanup(func() { cancelPool(); require.NoError(t, devices.Close(context.WithoutCancel(ctx))) })
+	var devices *nbd.DevicePool
+	if !pmemMode {
+		devices, err = nbd.NewDevicePool(2)
+		require.NoError(t, err)
+		poolCtx, cancelPool := context.WithCancel(context.WithoutCancel(ctx))
+		go devices.Populate(poolCtx)
+		t.Cleanup(func() { cancelPool(); require.NoError(t, devices.Close(context.WithoutCancel(ctx))) })
+	}
 	netPool := &builderEROFSNetworkPool{slots: make(map[string]*network.Slot), hostAccess: true}
 	t.Cleanup(func() { require.NoError(t, netPool.Close(context.WithoutCancel(ctx))) })
 	sandboxes := sandbox.NewSandboxesMap()
-	factory := sandbox.NewFactory(ctx, config.BuilderConfig, netPool, devices, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), nil, sandboxes)
+	var factory *sandbox.Factory
+	if pmemMode {
+		factory, err = sandbox.NewFileFactory(ctx, config.BuilderConfig, netPool, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), nil, sandboxes)
+		require.NoError(t, err)
+	} else {
+		factory = sandbox.NewFactory(ctx, config.BuilderConfig, netPool, devices, flags, hoststats.NewNoopDelivery(), cgroup.NewNoopManager(), network.NewNoopEgressProxy(), nil, sandboxes)
+	}
+	t.Cleanup(func() { require.NoError(t, factory.CloseSharedMounts(context.Background())) })
 	portListener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := portListener.Addr().(*net.TCPAddr).Port
@@ -197,10 +227,31 @@ func TestEROFSBuilderOCI(t *testing.T) { //nolint:paralleltest // Privileged VM 
 	buildID, templateID := uuid.NewString(), "erofs-builder-test"
 	force := true
 	buildConfig := buildconfig.TemplateConfig{Version: templates.TemplateV2LatestVersion, TeamID: uuid.NewString(), TemplateID: templateID, CacheScope: uuid.NewString(),
-		FromImage: ref.Name(), Force: &force, VCpuCount: 2, MemoryMB: 512, DiskSizeMB: 512, FreeDiskSizeMB: 256,
+		FromImage: ref.Name(), Force: &force, VCpuCount: 2, MemoryMB: memoryMB, DiskSizeMB: 512, FreeDiskSizeMB: 256,
 		HugePages: true, FreePageReporting: true, FreePageHinting: true, KernelVersion: versions.KernelVersion, FirecrackerVersion: versions.FirecrackerVersion,
 		Steps:    []*templatemanager.TemplateStep{{Type: "RUN", Args: []string{"printf 'real-oci-erofs-builder\\n' > /opt/erofs-build-marker; sync", "root"}}},
 		ReadyCmd: "test \"$(cat /opt/erofs-build-marker)\" = real-oci-erofs-builder",
+	}
+	if agentTemplate {
+		setup := "id user >/dev/null 2>&1 || useradd -m -s /bin/bash user; chown -R root:root /testbed; cd /testbed; test \"$(git rev-parse HEAD)\" = 514579c655bf22e2af14f0743376ae1d7befe345; /opt/miniconda3/envs/testbed/bin/python -m pip install --no-deps --no-build-isolation -e .; /opt/miniconda3/envs/testbed/bin/python -c 'import sympy; print(sympy.__version__)'; claude --version; chown -R user:user /testbed"
+		buildConfig.Steps = append(buildConfig.Steps, &templatemanager.TemplateStep{Type: "RUN", Args: []string{"set -eu; " + setup, "root"}})
+	}
+	if pmemMode {
+		var archive bytes.Buffer
+		gz := gzip.NewWriter(&archive)
+		tw := tar.NewWriter(gz)
+		payload := []byte("real-copy-input\n")
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: "copied.txt", Mode: 0644, Size: int64(len(payload))}))
+		_, err := tw.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, tw.Close())
+		require.NoError(t, gz.Close())
+		hash := fmt.Sprintf("%x", sha256.Sum256(archive.Bytes()))
+		blob, err := storageBuild.OpenBlob(ctx, buildpaths.GetLayerFilesCachePath(buildConfig.CacheScope, hash))
+		require.NoError(t, err)
+		require.NoError(t, blob.Put(ctx, archive.Bytes()))
+		buildConfig.Steps = append(buildConfig.Steps, &templatemanager.TemplateStep{Type: "COPY", Args: []string{"copied.txt", "/usr/local/bin/erofs-copy-marker", "root", "0644"}, FilesHash: &hash})
+		buildConfig.ReadyCmd += " && test \"$(cat /usr/local/bin/erofs-copy-marker)\" = real-copy-input"
 	}
 	result, err := builder.Build(ctx, storage.Paths{BuildID: buildID}, buildConfig, core)
 	require.NoError(t, err)
@@ -211,8 +262,14 @@ func TestEROFSBuilderOCI(t *testing.T) { //nolint:paralleltest // Privileged VM 
 	require.NoError(t, err)
 	final, err := store.Load(buildID)
 	require.NoError(t, err)
-	require.Equal(t, int64(512<<20), final.Manifest.Memory.Size)
-	require.Equal(t, result.RootfsSizeMB<<20, final.Manifest.Disk.Size)
+	require.Equal(t, memoryMB<<20, final.Manifest.Memory.Size)
+	require.Equal(t, result.RootfsSizeMB<<20, final.Manifest.WritableDisk().Size)
+	require.Positive(t, result.RootfsSizeMB)
+	if pmemMode {
+		require.Equal(t, erofs.LayoutPmem, final.Manifest.Boot.Layout)
+		require.Equal(t, "full", final.Manifest.MemoryCapture)
+		require.Empty(t, final.Manifest.ParentID)
+	}
 	meta, err := metadata.FromFile(final.MetadataPath())
 	require.NoError(t, err)
 	require.Equal(t, buildID, meta.Template.BuildID)
@@ -221,18 +278,70 @@ func TestEROFSBuilderOCI(t *testing.T) { //nolint:paralleltest // Privileged VM 
 	tmpl, err := cache.GetTemplate(ctx, buildID, false, false)
 	require.NoError(t, err)
 	runtime := sandbox.RuntimeMetadata{SandboxID: "t" + uuid.NewString()[:8], ExecutionID: uuid.NewString(), TemplateID: templateID, TeamID: buildConfig.TeamID, BuildID: buildID, SandboxType: sandbox.SandboxTypeBuild}
-	sbx, err := factory.ResumeSandbox(ctx, tmpl, sandbox.NewConfig(sandbox.Config{Vcpu: 2, RamMB: 512, FirecrackerConfig: versions, Envd: sandbox.EnvdMetadata{Version: result.EnvdVersion}}), runtime, time.Now(), time.Now().Add(time.Hour), nil)
+	sbx, err := factory.ResumeSandbox(ctx, tmpl, sandbox.NewConfig(sandbox.Config{Vcpu: 2, RamMB: memoryMB, FirecrackerConfig: versions, Envd: sandbox.EnvdMetadata{Version: result.EnvdVersion}}), runtime, time.Now(), time.Now().Add(time.Hour), nil)
 	require.NoError(t, err)
 	defer sbx.Close(context.WithoutCancel(ctx))
 	var stdout strings.Builder
 	verify := "set -eu; test \"$(cat /opt/erofs-build-marker)\" = real-oci-erofs-builder; test \"$(cat /proc/1/comm)\" = systemd; systemctl is-active --quiet envd; . /usr/local/share/e2b/distro.env; test \"$E2B_INIT_SYSTEM\" = systemd; id user; grep -q 'BUILD_ID=" + buildID + "' /.e2b; echo EROFS-BUILDER-PASS"
 	require.NoError(t, sandboxtools.RunCommandWithOutput(ctx, sbxProxy, runtime.SandboxID, verify, metadata.Context{User: "root"}, func(out, _ string) { stdout.WriteString(out) }))
 	require.Contains(t, stdout.String(), "EROFS-BUILDER-PASS")
+	if pmemMode {
+		require.NoError(t, sandboxtools.RunCommandWithOutput(ctx, sbxProxy, runtime.SandboxID, "test -f /.e2b-rootfs/lower/usr/local/bin/erofs-copy-marker && test ! -e /.e2b-rootfs/upperfs/upper/usr/local/bin/erofs-copy-marker", metadata.Context{User: "root"}, func(string, string) {}))
+	}
+
 	require.NoError(t, sbx.Close(ctx))
+	if pmemMode && !agentTemplate {
+		// Repeat the same recipe with cached intermediate layers. Finalization
+		// still creates a fresh upper with the configured root reservation.
+		cachedConfig := buildConfig
+		noForce := false
+		cachedConfig.Force = &noForce
+		cachedID := uuid.NewString()
+		cachedResult, err := builder.Build(ctx, storage.Paths{BuildID: cachedID}, cachedConfig, core)
+		require.NoError(t, err)
+		cachedSnapshot, err := store.Load(cachedID)
+		require.NoError(t, err)
+		require.Equal(t, cachedResult.RootfsSizeMB<<20, cachedSnapshot.Manifest.WritableDisk().Size)
+		// A derived build reads the complete merged parent, including RUN/COPY
+		// results, then creates a different lower through the Guest export helper.
+		derived := buildConfig
+		derived.FromImage = ""
+		derived.FromTemplate = &templatemanager.FromTemplateConfig{Alias: "pmem-parent", BuildID: buildID}
+		derived.Steps = []*templatemanager.TemplateStep{{Type: "RUN", Args: []string{"test \"$(cat /usr/local/bin/erofs-copy-marker)\" = real-copy-input; rm /usr/local/bin/erofs-copy-marker; printf derived > /opt/derived-marker; sync", "root"}}}
+		derived.ReadyCmd = "test \"$(cat /opt/derived-marker)\" = derived && test ! -e /usr/local/bin/erofs-copy-marker"
+		derivedID := uuid.NewString()
+		derivedResult, err := builder.Build(ctx, storage.Paths{BuildID: derivedID}, derived, core)
+		require.NoError(t, err)
+		derivedSnapshot, err := store.Load(derivedID)
+		require.NoError(t, err)
+		require.NotEqual(t, final.Manifest.Lower.ID, derivedSnapshot.Manifest.Lower.ID)
+		require.Empty(t, derivedSnapshot.Manifest.ParentID)
+		require.Equal(t, "full", derivedSnapshot.Manifest.MemoryCapture)
+		childTemplate, err := cache.GetTemplate(ctx, derivedID, false, false)
+		require.NoError(t, err)
+		childRuntime := runtime
+		childRuntime.SandboxID = "t" + uuid.NewString()[:8]
+		childRuntime.ExecutionID = uuid.NewString()
+		childRuntime.BuildID = derivedID
+		child, err := factory.ResumeSandbox(ctx, childTemplate, sandbox.NewConfig(sandbox.Config{Vcpu: 2, RamMB: memoryMB, FirecrackerConfig: versions, Envd: sandbox.EnvdMetadata{Version: derivedResult.EnvdVersion}}), childRuntime, time.Now(), time.Now().Add(time.Hour), nil)
+		require.NoError(t, err)
+		defer child.Close(context.WithoutCancel(ctx))
+		require.NoError(t, sandboxtools.RunCommandWithOutput(ctx, sbxProxy, childRuntime.SandboxID, derived.ReadyCmd+" && grep -q BUILD_ID="+derivedID+" /.e2b", metadata.Context{User: "root"}, func(string, string) {}))
+		require.NoError(t, child.Close(ctx))
+		_, err = os.Stat("/sys/module/nbd")
+		require.ErrorIs(t, err, os.ErrNotExist)
+		t.Logf("pmem Builder cached rebuild %s and FROM-template %s passed", cachedID, derivedID)
+	}
 	logData, err := os.ReadFile(filepath.Join(work, "build.log"))
 	require.NoError(t, err)
 	require.Contains(t, string(logData), "Provisioning was successful")
 	successReport = map[string]any{"status": "passed", "oci_digest": imageDigest.String(), "build_id": buildID, "envd_version": result.EnvdVersion, "firecracker_sha256": builderEROFSHash(t, inputs["FC"]), "initial_oci": true, "real_provisioning": true, "real_systemd": true, "run_step": true, "finalize": true, "final_file_restore": true}
+	successReport["native_only"], successReport["agent_template"], successReport["memory_mb"] = pmemMode, agentTemplate, memoryMB
+	successReport["store_root"], successReport["kernel_version"], successReport["firecracker_version"] = config.EROFSSnapshotDir, versions.KernelVersion, versions.FirecrackerVersion
+	if pmemMode {
+		successReport["lower_id"] = final.Manifest.Lower.ID
+	}
+
 	t.Log("Builder.Build OCI -> provisioning -> systemd/envd -> USER/RUN -> finalize -> EROFS File restore passed")
 }
 

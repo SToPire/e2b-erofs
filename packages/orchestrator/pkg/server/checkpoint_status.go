@@ -113,11 +113,15 @@ func (s *Server) beginNativeCheckpoint(ctx context.Context, sbx *sandbox.Sandbox
 		}
 		return nil, fmt.Errorf("record native checkpoint: %w", err)
 	}
+	s.nativeCheckpointStateMu.Lock()
 	s.nativeCheckpoints.Store(in.GetBuildId(), op)
+	s.nativeCheckpointStateMu.Unlock()
 	return op, nil
 }
 
 func (s *Server) updateNativeCheckpoint(buildID string, update func(*nativeCheckpointOperation)) {
+	s.nativeCheckpointStateMu.Lock()
+	defer s.nativeCheckpointStateMu.Unlock()
 	value, ok := s.nativeCheckpoints.Load(buildID)
 	if !ok {
 		return
@@ -232,9 +236,21 @@ func (s *Server) CheckpointStatus(ctx context.Context, in *orchestrator.SandboxC
 	if generationErr != nil && !generationMissing {
 		return nil, status.Errorf(codes.Internal, "inspect checkpoint directory: %v", generationErr)
 	}
-	snapshot, verifyErr := store.VerifyCommitted(ctx, in.GetBuildId())
+	var snapshot *erofs.Snapshot
+	var verifyErr error
+	pendingVerification := false
+	if generationMissing {
+		snapshot, verifyErr = store.VerifyCommitted(ctx, in.GetBuildId())
+	} else {
+		snapshot, verifyErr, pendingVerification = s.verifyNativeCheckpointStatus(ctx, store, in.GetBuildId())
+	}
 	switch {
+	case pendingVerification:
+		response.SnapshotState = orchestrator.CheckpointSnapshotState_CHECKPOINT_SNAPSHOT_IN_PROGRESS
 	case verifyErr == nil:
+		if err := s.persistObservedNativeCommit(in.GetBuildId()); err != nil {
+			return nil, status.Errorf(codes.Internal, "persist checkpoint commit observation: %v", err)
+		}
 		response.SnapshotState = orchestrator.CheckpointSnapshotState_CHECKPOINT_SNAPSHOT_COMMITTED
 	case snapshot != nil:
 		response.SnapshotState = orchestrator.CheckpointSnapshotState_CHECKPOINT_SNAPSHOT_DURABILITY_UNKNOWN
@@ -251,11 +267,24 @@ func (s *Server) CheckpointStatus(ctx context.Context, in *orchestrator.SandboxC
 			response.SnapshotState = orchestrator.CheckpointSnapshotState_CHECKPOINT_SNAPSHOT_NOT_COMMITTED
 		}
 	default:
+		if errors.Is(verifyErr, erofs.ErrUnprotectedVerificationStore) {
+			return nil, status.Error(codes.FailedPrecondition, verifyErr.Error())
+		}
 		if ctx.Err() != nil {
 			return nil, status.FromContextError(ctx.Err()).Err()
 		}
 		return nil, status.Errorf(codes.DataLoss, "validate checkpoint: %v", verifyErr)
 	}
+	s.nativeCheckpointStateMu.RLock()
+	defer s.nativeCheckpointStateMu.RUnlock()
+	// Receipt, active checkpoint operations and runtime are observed against
+	// checkpoint admission/completion under one lock. Live registration precedes
+	// completion, so a replacement cannot disappear between the two samples.
+	record, op, recordErr = s.readNativeCheckpoint(in.GetBuildId())
+	if recordErr != nil {
+		return nil, status.Errorf(codes.Internal, "reread checkpoint receipt: %v", recordErr)
+	}
+	active = !record.Finished && (op != nil || erofs.ProcessTerminated(record.Server) != nil)
 	// Re-sample after validation: a snapshot can commit while hashing its
 	// parent chain. A live observation taken before that commit could refer
 	// to the old VM and cannot be combined with the new committed snapshot.
@@ -292,7 +321,7 @@ func (s *Server) CheckpointStatus(ctx context.Context, in *orchestrator.SandboxC
 		}
 		if op != nil {
 			op.mu.Lock()
-			stopped = op.original.ProcessExited() && (op.replacement == nil || op.replacement.ProcessExited())
+			stopped = op.original != nil && op.original.ProcessExited() && (op.replacement == nil || op.replacement.ProcessExited())
 			op.mu.Unlock()
 		}
 		if stopped {
@@ -300,4 +329,23 @@ func (s *Server) CheckpointStatus(ctx context.Context, in *orchestrator.SandboxC
 		}
 	}
 	return response, nil
+}
+
+// Verification can discover an externally recovered commit after the action
+// returned. Persist that fact without replacing newer runtime receipt fields.
+func (s *Server) persistObservedNativeCommit(buildID string) error {
+	s.nativeCheckpointStateMu.Lock()
+	defer s.nativeCheckpointStateMu.Unlock()
+	record, op, err := s.readNativeCheckpoint(buildID)
+	if err != nil {
+		return err
+	}
+	record.Committed = true
+	if op != nil {
+		op.mu.Lock()
+		defer op.mu.Unlock()
+		op.record.Committed = true
+		record = op.record
+	}
+	return writeCheckpointRecord(s.checkpointRecordPath(buildID), record, false)
 }

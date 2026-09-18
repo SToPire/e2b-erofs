@@ -58,6 +58,10 @@ paths:
                 lifecycleID:
                   type: string
                   description: Lifecycle ID of the sandbox
+                resumePhase:
+                  type: string
+                  enum: [prepare, commit]
+                  description: Pmem rootfs restore phase; prepare authenticates and thaws upper before initialization, commit releases workloads after initialization and upgrade.
                 envVars:
                   $ref: "#/components/schemas/EnvVars"
                 accessToken:

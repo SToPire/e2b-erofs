@@ -11,6 +11,7 @@ import (
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/buildcontext"
+	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/pmem"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/core/rootfs"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/template/build/phases/base/aptmirror"
@@ -61,6 +62,17 @@ func (bb *BaseBuilder) Hash(ctx context.Context, _ phases.LayerResult) (string, 
 
 	if rendersRootfsFiles(bb.BuildContext) && mirror.CacheKey() != "" {
 		provisionVersion = cache.HashKeys(provisionVersion, mirror.CacheKey())
+	}
+	if bb.BuilderConfig.EROFSNativeOnly {
+		provisionVersion = cache.HashKeys(provisionVersion, fmt.Sprintf("pmem-reserved-mb:%d", max(0, bb.featureFlags.IntFlag(ctx, featureflags.BuildReservedDiskSpaceMB))))
+		versions := fc.Config{KernelVersion: bb.Config.KernelVersion, FirecrackerVersion: bb.Config.FirecrackerVersion}
+		for _, path := range []string{versions.HostKernelPath(bb.BuilderConfig), versions.FirecrackerPath(bb.BuilderConfig), bb.BuilderConfig.EROFSPmemInitramfsPath} {
+			digest, err := pmem.DigestBinary(ctx, path)
+			if err != nil {
+				return "", fmt.Errorf("hash pmem build artifact: %w", err)
+			}
+			provisionVersion = cache.HashKeys(provisionVersion, digest)
+		}
 	}
 
 	attrs := []attribute.KeyValue{
@@ -126,6 +138,10 @@ func baseLayerKey(indexVersion, provisionVersion, baseSource string, buildContex
 		provisionVersion,
 		strconv.FormatInt(buildContext.Config.DiskSizeMB, 10),
 		baseSource,
+	}
+	if buildContext.BuilderConfig.EROFSNativeOnly {
+		keys = append(keys, pmem.BuildContract, buildContext.Config.KernelVersion, buildContext.Config.FirecrackerVersion,
+			strconv.FormatInt(buildContext.Config.FreeDiskSizeMB, 10))
 	}
 
 	// Only when there are arguments, and this is the whole reason the append is

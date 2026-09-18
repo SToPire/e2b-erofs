@@ -245,6 +245,10 @@ func (a *API) PostInit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer a.initLock.Release(1)
+		if a.pmem != nil || initRequest.ResumePhase != nil {
+			a.postPmemInit(w, r, &initRequest)
+			return
+		}
 
 		// Validate auth before installing the unfreeze defer or running SetData,
 		// so stale/replayed but unauthorized requests can't thaw cgroups.
@@ -354,6 +358,18 @@ func (a *API) reportMemoryProtection(w http.ResponseWriter) {
 }
 
 func (a *API) SetData(ctx context.Context, logger zerolog.Logger, data PostInitJSONBody) error {
+	return a.setData(ctx, logger, data, true)
+}
+
+func (a *API) adoptInitToken(token *SecureToken) {
+	if token.IsSet() {
+		a.accessToken.TakeFrom(token)
+	} else if a.accessToken.IsSet() {
+		a.accessToken.Destroy()
+	}
+}
+
+func (a *API) setData(ctx context.Context, logger zerolog.Logger, data PostInitJSONBody, adoptToken bool) error {
 	if data.Timestamp != nil {
 		// Check if current time differs significantly from the received timestamp
 		if shouldSetSystemTime(time.Now(), *data.Timestamp) {
@@ -372,12 +388,8 @@ func (a *API) SetData(ctx context.Context, logger zerolog.Logger, data PostInitJ
 		a.defaults.EnvVars.ReplaceUserVars(*data.EnvVars)
 	}
 
-	if data.AccessToken.IsSet() {
-		logger.Debug().Msg("Setting access token")
-		a.accessToken.TakeFrom(data.AccessToken)
-	} else if a.accessToken.IsSet() {
-		logger.Debug().Msg("Clearing access token")
-		a.accessToken.Destroy()
+	if adoptToken {
+		a.adoptInitToken(data.AccessToken)
 	}
 
 	if data.HyperloopIP != nil {

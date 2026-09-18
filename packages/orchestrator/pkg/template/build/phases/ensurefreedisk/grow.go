@@ -275,7 +275,10 @@ type offlineDevice struct {
 }
 
 func (b *EnsureFreeDiskBuilder) openOfflineDevice(ctx context.Context, backend block.Device) (*offlineDevice, error) {
-	mnt := b.sandboxFactory.NewDirectPathMount(backend)
+	mnt, err := b.sandboxFactory.NewDirectPathMount(backend)
+	if err != nil {
+		return nil, err
+	}
 	idx, err := mnt.Open(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open NBD device: %w", err)

@@ -175,3 +175,13 @@ func TestParseReservedBlocks(t *testing.T) {
 		})
 	}
 }
+
+func TestMakeDAXDisablesInlineData(t *testing.T) {
+	t.Parallel()
+	requireTools(t, "mkfs.ext4", "dumpe2fs")
+	path := filepath.Join(t.TempDir(), "dax.ext4")
+	require.NoError(t, Make(t.Context(), path, 64, makeBlockSize, MakeOptions{NoInlineData: true}))
+	out, err := exec.CommandContext(t.Context(), "dumpe2fs", "-h", path).CombinedOutput()
+	require.NoError(t, err)
+	require.NotContains(t, string(out), "inline_data")
+}
